@@ -1,0 +1,10 @@
+output/*
+*.mp4
+*.mp3
+*.wav
+*.avi
+*.mov
+*.gif
+.DS_Store
+__pycache__
+*.pdf
