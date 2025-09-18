@@ -9,18 +9,47 @@ class Obstacle():
         """
         :param centroid: centroid of the obstacle
         :param dx: length of the vehicle >=0
-        :param dy: width of the vegicle >= 0
+        :param dy: width of the vehicle >= 0
         :param angle: anti-clockwise rotation from the x-axis
-        :param vel: [x-velocity, y-velocity], put [0,0] for static objects
         :param acc: [x-acceleration, y-acceleration], put [0,0] for static objects/constant velocity
         """
         self.centroid = centroid
         self.dx = dx
         self.dy = dy
         self.angle = angle
-        self.vel = vel #moving up/right is positive
         self.acc = acc
         self.time = 0 #time is incremented for every self.update() call
+
+    def __get_points(self):
+        """
+        :return A line: ((x1,y1,x1',y1'))
+                or four line segments: ((x1,y1,x1',y1'), (x2,y2,x2',y2'), (x3,y3,x3',y3'), (x4,y4,x4',y4'))
+        """
+        dx_cos = self.dx*np.cos(self.angle)
+        dx_sin = self.dx*np.sin(self.angle)
+        dy_sin = self.dy*np.sin(self.angle)
+        dy_cos = self.dy*np.cos(self.angle)
+
+        BR_x = self.centroid[0] + 0.5*(dx_cos + dy_sin) #BR=Bottom-right
+        BR_y = self.centroid[1] + 0.5*(dx_sin - dy_cos)
+        BL_x = self.centroid[0] - 0.5*(dx_cos - dy_sin)
+        BL_y = self.centroid[1] - 0.5*(dx_sin + dy_cos)
+        TL_x = self.centroid[0] - 0.5*(dx_cos + dy_sin)
+        TL_y = self.centroid[1] - 0.5*(dx_sin - dy_cos)
+        TR_x = self.centroid[0] + 0.5*(dx_cos - dy_sin)
+        TR_y = self.centroid[1] + 0.5*(dx_sin + dy_cos)
+
+        seg_bottom = (BL_x, BL_y, BR_x, BR_y)
+        seg_left = (BL_x, BL_y, TL_x, TL_y)
+
+        if self.dy == 0: #if no height
+            return (seg_bottom,)
+        elif self.dx == 0: # if no width
+            return (seg_left,)
+        else: #if rectangle
+            seg_top = (TL_x, TL_y, TR_x, TR_y)
+            seg_right = (BR_x, BR_y, TR_x, TR_y)
+            return (seg_bottom, seg_top, seg_left, seg_right)
 
     def __get_points(self, centroid):
         """

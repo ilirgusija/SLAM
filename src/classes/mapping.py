@@ -2,39 +2,23 @@ import math
 from collections import deque
 import matplotlib.pyplot as plt
 import numpy as np
-from functools import total_ordering
-import sys
+from utils.map import bresenham_vec
 
 EXTEND_AREA = 1.0
+FREE = 0.0
+OCCUPIED = 1.0
 
-@total_ordering
-class FloatGrid:
-    def __init__(self, init_val=0.5):
-        self.data = init_val
-
-    def get_float_data(self):
-        return self.data
-
-    def __eq__(self, other):
-        if not isinstance(other, FloatGrid):
-            return NotImplemented
-        return self.get_float_data() == other.get_float_data()
-
-    def __lt__(self, other):
-        if not isinstance(other, FloatGrid):
-            return NotImplemented
-        return self.get_float_data() < other.get_float_data()
 
 class GridMap:
     def __init__(self, x_min, x_max, y_min, y_max, resolution=1.0,
-                 init_val=FloatGrid(0.5)):
+                 init_val=0.5):
         """__init__
         :param x_min, x_max, y_min, y_max: positions of extremities of map [m]
         :param resolution: number of levels of quantization per meter [m]
         :param init_val: initial value for all grid cells
         """
         self.left_lower_x = x_min
-        self.left_lower_y = y_min 
+        self.left_lower_y = y_min
         self.resolution = resolution
         self.center_x = (x_max - x_min) / 2
         self.center_y = (y_max - y_min) / 2
@@ -63,39 +47,37 @@ class GridMap:
         else:
             return None
 
-    def get_xy_index_from_xy_pos(self, x_pos, y_pos):
-        """get_xy_index_from_xy_pos
+    def get_map_index_from_pos(self, pos):
+        """get_map_index_from_pos
 
-        :param x_pos: x position [m]
-        :param y_pos: y position [m]
+        :param pos: x,y position [m]
         """
         x_ind = self.calc_xy_index_from_position(
-            x_pos, self.left_lower_x, self.width)
+            pos[0], self.left_lower_x, self.width)
         y_ind = self.calc_xy_index_from_position(
-            y_pos, self.left_lower_y, self.height)
+            pos[1], self.left_lower_y, self.height)
 
         return x_ind, y_ind
 
     # Setters##################################################################
-    def set_value_from_xy_pos(self, x_pos, y_pos, val):
-        """set_value_from_xy_pos
+    def set_value_from_pos(self, pos, val):
+        """set_value_from_pos
 
         return bool flag, which means setting value is succeeded or not
 
-        :param x_pos: x position [m]
-        :param y_pos: y position [m]
+        :param pos: x, y position [m]
         :param val: grid value
         """
 
-        x_ind, y_ind = self.get_xy_index_from_xy_pos(x_pos, y_pos)
+        x_ind, y_ind = self.get_map_index_from_pos(pos)
 
         if (not x_ind) or (not y_ind):
-            
-            # print("returning false on set_value_from_xy_pos")
+
+            # print("returning false on set_value_from_pos")
             # raise ValueError("Not GOOD!")
             return False  # NG
-        
-        # print("not returning false on set_value_from_xy_pos")
+
+        # print("not returning false on set_value_from_pos")
         flag = self.set_value_from_xy_index(x_ind, y_ind, val)
 
         return flag
@@ -162,16 +144,15 @@ class GridMap:
         y_ind, x_ind = divmod(grid_ind, self.width)
         return x_ind, y_ind
 
-    def calc_grid_index_from_xy_pos(self, x_pos, y_pos):
-        """get_xy_index_from_xy_pos
+    def calc_grid_index_from_xy_pos(self, pos):
+        """get_map_index_from_pos
 
-        :param x_pos: x position [m]
-        :param y_pos: y position [m]
+        :param pos: x, y position [m]
         """
         x_ind = self.calc_xy_index_from_position(
-            x_pos, self.left_lower_x, self.width)
+            pos[0], self.left_lower_x, self.width)
         y_ind = self.calc_xy_index_from_position(
-            y_pos, self.left_lower_y, self.height)
+            pos[1], self.left_lower_y, self.height)
 
         return self.calc_grid_index_from_xy_index(x_ind, y_ind)
 
@@ -205,7 +186,7 @@ class GridMap:
         else:
             return False
 
-    def expand_grid(self, occupied_val=FloatGrid(1.0)):
+    def expand_grid(self, occupied_val=1.0):
         x_inds, y_inds, values = [], [], []
 
         for ix in range(self.width):
@@ -225,7 +206,6 @@ class GridMap:
 
     @staticmethod
     def check_inside_polygon(iox, ioy, x, y):
-
         n_point = len(x) - 1
         inside = False
         for i1 in range(n_point):
@@ -264,12 +244,174 @@ class GridMap:
 
         return heat_map
 
+
+class GridMapNP:
+    def __init__(self, x_min, x_max, y_min, y_max, resolution=1.0,
+                 init_val=0.5):
+        """__init__
+        :param x_min, x_max, y_min, y_max: positions of extremities of map [m]
+        :param resolution: number of levels of quantization per meter [m]
+        :param init_val: initial value for all grid cells
+        """
+        self.left_lower = np.array([x_min, y_min])
+        self.right_upper = np.array([x_max, y_max])
+        self.resolution = resolution
+        self.center = np.array([(x_max - x_min) / 2, (y_max - y_min) / 2])
+
+        self.width = int((x_max-x_min+1) * 1/self.resolution)
+        self.height = int((y_max-y_min+1) * 1/self.resolution)
+
+        self.data = np.full((self.width, self.height),
+                            init_val, dtype=type(init_val))
+        self.size = self.width * self.height
+        self.data_type = type(init_val)
+
+    # Getters##################################################################
+    def get_value_from_xy_index(self, x_ind, y_ind):
+        if x_ind is None or y_ind is None:
+            return None
+        if 0 <= x_ind < self.width and 0 <= y_ind < self.height:
+            return self.data[x_ind, y_ind]
+        else:
+            return None
+
+    def get_values_from_xy_indices(self, x_inds, y_inds):
+        if (x_inds is None) or (y_inds is None):
+            raise ValueError("returning false from get_values_from_xy_indices")
+        valid = (x_inds >= 0) & (x_inds < self.width) & (
+            y_inds >= 0) & (y_inds < self.height)
+        if not np.all(valid):
+            print(f"x_inds: {x_inds} or y_inds: {y_inds} out of bounds")
+            raise ValueError(
+                f"x_inds: {x_inds} or y_inds: {y_inds} out of bounds")
+        return self.data[x_inds, y_inds]
+
+    def get_map_index_from_pos(self, pos):
+        x_ind, y_ind = np.floor(
+            (pos - self.left_lower) / self.resolution, dtype=int)
+        if 0 <= x_ind < self.width and 0 <= y_ind < self.height:
+            return x_ind, y_ind
+        else:
+            raise ValueError(f'Index {x_ind}, {y_ind} out of bounds!')
+
+    def get_map_indices_from_positions(self, positions):
+        x_inds, y_inds = np.floor(
+            (positions - self.left_lower) / self.resolution).astype(int)
+        valid = (x_inds >= 0) & (x_inds < self.width) & (
+            y_inds >= 0) & (y_inds < self.height)
+        if np.all(valid):
+            return x_inds, y_inds
+        else:
+            print(f"x_inds: {x_inds} or y_inds: {y_inds} out of bounds")
+            raise ValueError(
+                f"x_inds: {x_inds} or y_inds: {y_inds} out of bounds")
+
+    def get_position_from_map_index(self, x_ind, y_ind):
+        return self.left_lower + np.array([x_ind, y_ind]) * self.resolution
+
+    def get_map_positions(self, grid):
+        """
+        Takes in a HxW occupancy map as an argument and returns a (H*W, 2) array of positions
+        corresponding to each grid cell (x=j, y=i) at cell centers in world coordinates.
+        """
+        H, W = grid.shape
+        ii, jj = np.indices((H, W))  # ii: rows (y/i), jj: cols (x/j)
+        xy_indices = np.stack((jj.ravel(), ii.ravel()),
+                              axis=1)  # (N, 2) as (x, y)
+        return self.left_lower + (xy_indices + 0.5) * self.resolution
+
+    def get_occupied_map_positions(self, grid):
+        """
+        Takes in an (H, W) occupancy grid and returns (K, 2) positions of nonzero cells.
+        """
+        ij = np.argwhere(grid != 0)         # (K, 2) with (i, j) = (row, col)
+        xy = ij[:, [1, 0]]                  # reorder to (x=j, y=i)
+        return self.left_lower + (xy + 0.5) * self.resolution
+
+    # Setters##################################################################
+    def set_value_from_pos(self, pos, val):
+        x_ind, y_ind = self.get_map_index_from_pos(pos)
+        if (not x_ind) or (not y_ind):
+            raise ValueError("Not GOOD!")
+            # return False
+        flag = self.set_value_from_xy_index(x_ind, y_ind, val)
+        return flag
+
+    def set_value_from_xy_index(self, x_ind, y_ind, val):
+        if (x_ind is None) or (y_ind is None):
+            raise ValueError("returning false from set_value_from_xy_index")
+        if 0 <= x_ind < self.width and 0 <= y_ind < self.height and isinstance(val, self.data_type):
+            self.data[x_ind, y_ind] = val
+            return True
+        else:
+            print(f'x_ind: {x_ind}, y_ind: {y_ind} out of bounds')
+            print(f'val: {val} vs self.data_type: {self.data_type}')
+            raise ValueError(f'y_ind: {y_ind} or x_ind: {x_ind} out of bounds')
+
+    def set_values_from_xy_indices(self, inds, val):
+        if (inds is None):
+            raise ValueError("returning false from set_values_from_xy_indices")
+        valid = (inds[0] >= 0) & (inds[0] < self.width) & (
+            inds[1] >= 0) & (inds[1] < self.height)
+        if not np.all(valid):
+            print(f"inds: {inds} out of bounds")
+            print(f"val: {val} vs self.data_type: {self.data_type}")
+            raise ValueError(
+                f"inds: {inds} out of bounds")
+        if not isinstance(val, self.data_type):
+            raise ValueError(
+                f"val: {val} is not a valid data type for self.data_type: {self.data_type}")
+        # TODO: check if this is a valid way to access array element
+        self.data[inds] = val
+        return True
+
+    # Rest of the methods are the same as in the original GridMap class
+    def check_occupied_from_xy_index(self, x_ind, y_ind, occupied_val):
+        val = self.get_value_from_xy_index(x_ind, y_ind)
+        if val is None or val >= occupied_val:
+            return True
+        else:
+            return False
+
+    def expand_grid(self, occupied_val=1.0):
+        x_inds, y_inds, values = [], [], []
+        for ix in range(self.width):
+            for iy in range(self.height):
+                if self.check_occupied_from_xy_index(ix, iy, occupied_val):
+                    x_inds.append(ix)
+                    y_inds.append(iy)
+                    values.append(self.get_value_from_xy_index(ix, iy))
+        for (ix, iy, value) in zip(x_inds, y_inds, values):
+            self.set_value_from_xy_index(ix + 1, iy, val=value)
+            self.set_value_from_xy_index(ix, iy + 1, val=value)
+            self.set_value_from_xy_index(ix + 1, iy + 1, val=value)
+            self.set_value_from_xy_index(ix - 1, iy, val=value)
+            self.set_value_from_xy_index(ix, iy - 1, val=value)
+            self.set_value_from_xy_index(ix - 1, iy - 1, val=value)
+
+    def print_grid_map_info(self):
+        print("width:", self.width)
+        print("height:", self.height)
+        print("resolution:", self.resolution)
+        print("center_x:", self.center_x)
+        print("center_y:", self.center_y)
+        print("left_lower_x:", self.left_lower_x)
+        print("left_lower_y:", self.left_lower_y)
+
+    def plot_grid_map(self, ax=None):
+        grid_data = self.data
+        if not ax:
+            fig, ax = plt.subplots()
+        heat_map = ax.pcolor(grid_data, cmap="Blues", vmin=0.0, vmax=1.0)
+        plt.axis("equal")
+        return heat_map
+
+
 class LidarGridMap:
-    def __init__(self, x_min, x_max, y_min, y_max):
-        self.xy_resolution = 0.02  # x-y grid resolution
-        # self.xy_resolution = 1.0
-        # default 0.5 -- [[0.5 for i in range(y_w)] for i in range(x_w)]
-        self.occupancy_map = GridMap(x_min, x_max, y_min, y_max, resolution=self.xy_resolution)
+    def __init__(self, x_min, x_max, y_min, y_max, resolution=0.02):
+        self.xy_resolution = resolution
+        self.occupancy_map = GridMap(
+            x_min, x_max, y_min, y_max, resolution=self.xy_resolution)
 
     @staticmethod
     def bresenham(start, end):
@@ -283,34 +425,29 @@ class LidarGridMap:
         np.array([[4,4], [4,5], [5,6], [5,7], [5,8], [6,9], [6,10]])
         """
         # setup initial conditions
-        x1, y1 = start
-        x2, y2 = end
-        dx = x2 - x1
-        dy = y2 - y1
-        is_steep = abs(dy) > abs(dx)  # determine how steep the line is
+        d = end - start
+        is_steep = abs(d[1]) > abs(d[0])  # determine how steep the line is
         if is_steep:  # rotate line
-            x1, y1 = y1, x1
-            x2, y2 = y2, x2
+            start[0], start[1] = start[1], start[0]
+            end[0], end[1] = end[1], end[0]
         # swap start and end points if necessary and store swap state
         swapped = False
-        if x1 > x2:
-            x1, x2 = x2, x1
-            y1, y2 = y2, y1
+        if start[0] > end[0]:
+            start, end = end, start
             swapped = True
-        dx = x2 - x1  # recalculate differentials
-        dy = y2 - y1  # recalculate differentials
-        error = int(dx / 2.0)  # calculate error
-        y_step = 1 if y1 < y2 else -1
+        d = end - start  # recalculate differentials
+        error = int(d[0] / 2.0)  # calculate error
+        y_step = 1 if start[1] < end[1] else -1
         # iterate over bounding box generating points between start and end
-        y = y1
+        y = start[1]
         points = []
-        for x in range(x1, x2 + 1):
+        for x in range(start[0], end[0] + 1):
             coord = [y, x] if is_steep else (x, y)
             points.append(coord)
-            error -= abs(dy)
+            error -= abs(d[1])
             if error < 0:
                 y += y_step
-                error += dx
+                error += d[0]
         if swapped:  # reverse the list if the coordinates were swapped
             points.reverse()
         points = np.array(points)
@@ -382,68 +519,62 @@ class LidarGridMap:
                     occupancy_map[nx, ny + 1] = 0.0
                     fringe.appendleft((nx, ny + 1))
 
-    def update_grid_map(self, pos_x, pos_y, ox, oy, is_obstacle):
+    def update_grid_map(self, pos, ox, oy, is_obstacle):
         """
         The breshenham boolean tells if it's computed with bresenham ray casting
         (True) or with flood fill (False)
         """
-        center_x, center_y = self.occupancy_map.get_xy_index_from_xy_pos(pos_x,pos_y)
-        zero = FloatGrid(0.0)
-        one = FloatGrid(1.0)
+        center_x, center_y = self.occupancy_map.get_map_index_from_pos(pos)
         # occupancy grid computed with bresenham ray casting
         for i, (x, y) in enumerate(zip(ox, oy)):
             # Get index of the endpoint
-            ix, iy = self.occupancy_map.get_xy_index_from_xy_pos(x, y)
+            ix, iy = self.occupancy_map.get_map_index_from_pos(np.array[x, y])
             if ix is None or iy is None:
                 continue
-                
+
             # Line from the lidar to the endpoint
             laser_beam = self.bresenham((center_x, center_y), (ix, iy))
-            
+
             # Mark cells along beam as free
             for (x_free, y_free) in laser_beam:
-                if self.occupancy_map.get_value_from_xy_index(x_free,y_free) != one:
-                    self.occupancy_map.set_value_from_xy_index(x_free, y_free, zero)
-            
+                if self.occupancy_map.get_value_from_xy_index(x_free, y_free) != OCCUPIED:
+                    self.occupancy_map.set_value_from_xy_index(
+                        x_free, y_free, FREE)
+
             # Only mark endpoint as occupied if it's an actual obstacle
             if is_obstacle[i]:
-                # print(f"updating ({ix},{iy}) as obstacle")
-                self.occupancy_map.set_value_from_xy_index(ix, iy, one)
-                # extend the occupied area
-                # self.occupancy_map.set_value_from_xy_index(ix + 1, iy, one)  
-                # self.occupancy_map.set_value_from_xy_index(ix, iy + 1, one)  
-                # self.occupancy_map.set_value_from_xy_index(ix + 1, iy + 1, one)  
-
-def main():
-    """
-    Example usage
-    """
-    print(__file__, "start")
-    ang, dist = file_read("lidar01.csv")
-    ox = np.sin(ang) * dist
-    oy = np.cos(ang) * dist
-    occupancy_map, min_x, max_x, min_y, max_y, xy_resolution = \
-        generate_ray_casting_grid_map(ox, oy, xy_resolution, True)
-    xy_res = np.array(occupancy_map).shape
-    plt.figure(1, figsize=(10, 4))
-    plt.subplot(122)
-    plt.imshow(occupancy_map, cmap="PiYG_r")
-    # cmap = "binary" "PiYG_r" "PiYG_r" "bone" "bone_r" "RdYlGn_r"
-    plt.clim(-0.4, 1.4)
-    plt.gca().set_xticks(np.arange(-.5, xy_res[1], 1), minor=True)
-    plt.gca().set_yticks(np.arange(-.5, xy_res[0], 1), minor=True)
-    plt.grid(True, which="minor", color="w", linewidth=0.6, alpha=0.5)
-    plt.colorbar()
-    plt.subplot(121)
-    plt.plot([oy, np.zeros(np.size(oy))], [ox, np.zeros(np.size(oy))], "ro-")
-    plt.axis("equal")
-    plt.plot(0.0, 0.0, "ob")
-    plt.gca().set_aspect("equal", "box")
-    bottom, top = plt.ylim()  # return the current y-lim
-    plt.ylim((top, bottom))  # rescale y axis, to match the grid orientation
-    plt.grid(True)
-    plt.show()
+                self.occupancy_map.set_value_from_xy_index(ix, iy, OCCUPIED)
 
 
-if __name__ == '__main__':
-    main()
+class LidarGridMapVec:
+    def __init__(self, x_min, x_max, y_min, y_max, resolution=0.02):
+        self.xy_resolution = resolution
+        self.occupancy_map = GridMapNP(
+            x_min, x_max, y_min, y_max, resolution=self.xy_resolution)
+
+    def update_grid_map_vec(self, pos, detections, is_obstacle):
+        """
+        The breshenham boolean tells if it's computed with bresenham ray casting
+        (True) or with flood fill (False)
+        """
+        start = self.occupancy_map.get_map_index_from_pos(pos)
+        ends = self.occupancy_map.get_map_indices_from_positions(detections)
+        # Get index of the endpoint
+        # check if indices contains None
+        if any(index is None for index in ends):
+            raise ValueError(f"ends: {ends} contains None")
+        else:
+            # Only set the values of the detections that are obstacles
+            self.occupancy_map.set_values_from_xy_indices(
+                ends[is_obstacle], OCCUPIED)
+
+        # Line from the lidar to the endpoint
+        beams = bresenham_vec(start, ends)
+
+        # Mark cells along beam as free
+        for laser_beam in beams:
+            vals = self.occupancy_map.get_values_from_xy_indices(
+                laser_beam, FREE)
+            free_mask = vals != OCCUPIED
+            self.occupancy_map.set_values_from_xy_indices(
+                laser_beam[free_mask], FREE)

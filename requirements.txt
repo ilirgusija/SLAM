@@ -2,3 +2,5 @@ numpy
 pytest
 matplotlib
 yaml
+PIL
+scikit-learn

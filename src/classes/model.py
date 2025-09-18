@@ -119,14 +119,14 @@ class CarModel:
 
         return rx, ry
 
+
 class VelocityIntegratorModel:
     def __init__(self, i_x, i_y, dt, max_v):
         self.x = np.array([i_x, i_y], dtype=float)
         self.dt = dt
         self.max_v = max_v
 
-    def update(self, v_x, v_y):
-        v = np.array([v_x, v_y], dtype=float)
+    def update(self, v):
         speed = np.linalg.norm(v)
 
         # clip to max velocity
@@ -134,6 +134,15 @@ class VelocityIntegratorModel:
             v = v / speed * self.max_v
 
         self.x += v * self.dt
+        return self.x
+
+    def simulate(self, x, u):
+        speed = np.linalg.norm(u)
+        if speed > self.max_v:
+            u = u / speed * self.max_v
+        # x is Nx2 and u is 1x2, so x + u * self.dt is Nx2
+        x_star = x + u * self.dt
+        return x_star
 
     def plot(self):
         plt.plot(self.x[0], self.x[1], ".b")
@@ -141,18 +150,37 @@ class VelocityIntegratorModel:
     def get_state(self):
         return self.x
 
-class LIDAR:
-    def __init__(self, fov=np.pi, max_range=100, n_reflections=360):
-        """
-        :param fov: sight of the robot - typically pi or 4/3*pi
-        :param n_reflections: resolution=fov/n_reflections
-        :param max_range: max distance the robot can see. If no obstacle, laser end point = max_dist
-        """
-        self.max_range = max_range
-        self.fov = fov
-        self.n_reflections = n_reflections
-        self.resolution = fov/n_reflections
 
+class VIM_with_Noise(VelocityIntegratorModel):
+    def __init__(self, i_x, i_y, dt, max_v, noise_std):
+        super().__init__(i_x, i_y, dt, max_v)
+        self.noise_std = noise_std
+
+    def update(self, v):
+        x = super().update(v)
+        x += np.random.normal(0, self.noise_std, size=x.shape)
+        return x
+
+    def simulate(self, v):
+        x = super().simulate(v)
+        x += np.random.normal(0, self.noise_std, size=x.shape)
+        return x
+
+
+class LIDAR:
+    def __init__(self, fov=2*np.pi, r_max=100, B=360):
+        """
+        :param fov: sight of the robot - typically 2*pi or pi
+        :param B: number of beams - resolution=fov/B
+        :param r_max: max distance the robot can see. If no obstacle, laser end point = max_dist
+        """
+        self.r_max = r_max
+        self.fov = fov
+        self.B = B
+        self.resolution = fov/B
+        self.angles = np.linspace(0, self.fov*180/np.pi-1, self.B)*np.pi/180
+
+    # OPTIMIZE vectorize this
     def get_intersection(self, a1, a2, b1, b2):
         """
         :param a1: (x1,y1) line segment 1 - starting position
@@ -196,41 +224,41 @@ class LIDAR:
 
         return intersct
 
-    def get_laser_ref(self, segments,
-                      robot_pose=np.array([0.0, 0.0])):
+    # OPTIMIZE: vectorize this
+    def get_laser_ref(self, segments, robot_poses=np.array([[0.0, 0.0]])):
         """
         :param segments: start and end points of all segments as ((x1,y1,x1',y1'),
                                 (x2,y2,x2',y2'), (x3,y3,x3',y3'), (...))
                robot_pose: robot's pose in the global coordinate system
-        :return: 1xn_reflections array indicating the laser end point
+        :return: m_nxB array indicating the laser end point
         """
-        xy_robot = robot_pose[:2]  # robot position
-        theta_robot = robot_pose[2]  # robot angle in rad
+        if robot_poses.ndim == 1:
+            robot_poses = robot_poses[np.newaxis, :]
 
-        angles = np.linspace(theta_robot, theta_robot +
-                             self.fov, self.n_reflections)
-        # set all laser reflections to 100
-        dist_theta = self.max_range*np.ones(self.n_reflections)
+        # set all laser reflections to r_max
+        dist_theta = self.r_max*np.ones((robot_poses.shape[0], self.B))
 
         for seg_i in segments:
             # starting and ending points of each segment
             xy_i_start, xy_i_end = np.array(seg_i[:2]), np.array(seg_i[2:])
 
-            for j, theta in enumerate(angles):
-                # max possible distance
-                xy_ij_max = xy_robot + np.array([self.max_range*np.cos(theta),
-                                                 self.max_range*np.sin(theta)])
-                intersection = self.get_intersection(
-                    xy_i_start, xy_i_end, xy_robot, xy_ij_max)
+            for i, xy_robot in enumerate(robot_poses):
+                for j, theta in enumerate(self.angles):
+                    # max possible distance
+                    xy_ij_max = xy_robot + np.array([self.r_max*np.cos(theta),
+                                                    self.r_max*np.sin(theta)])
+                    intersection = self.get_intersection(
+                        xy_i_start, xy_i_end, xy_robot, xy_ij_max)
 
-                # if the line segments intersect
-                if intersection is not None:
-                    r = np.sqrt(np.sum((intersection-xy_robot)**2))  # radius
+                    # if the line segments intersect
+                    if intersection is not None:
+                        r = np.sqrt(
+                            np.sum((intersection-xy_robot)**2))  # radius
 
-                    if r < dist_theta[j]:
-                        dist_theta[j] = r
+                        if r < dist_theta[i, j]:
+                            dist_theta[i, j] = r
 
-        return angles, dist_theta
+        return dist_theta
 
     def get_filled_txy(self, dist_theta, angles, robot_pos,
                        unoccupied_points_per_meter=0.1, margin=0.1):
@@ -240,7 +268,8 @@ class LIDAR:
         :param robot_pos: robot pose
         :param unoccupied_points_per_meter: in-fill density
         :param margin: in-fill density of free points
-        :return: (points, labels) - 0 label for free points and 1 label for hits
+        :return: (points, labels) - where 0 label is for free points and 1 
+            label is for hits
         """
 
         laser_data_xy = np.vstack([dist_theta * np.cos(angles), dist_theta *
@@ -258,7 +287,7 @@ class LIDAR:
                 (laser_endpoint - robot_pos[:2])
 
             if i == 0:  # first data point
-                if dist >= self.max_range:  # there's no laser reflection
+                if dist >= self.r_max:  # there's no laser reflection
                     points = points_scan_i
                     labels = np.zeros((points_scan_i.shape[0], 1))
                 else:  # append the arrays with laser end-point
@@ -266,7 +295,7 @@ class LIDAR:
                     labels = np.vstack(
                         (np.zeros((points_scan_i.shape[0], 1)), np.array([1])[:, np.newaxis]))
             else:
-                if dist >= self.max_range:  # there's no laser reflection
+                if dist >= self.r_max:  # there's no laser reflection
                     points = np.vstack((points, points_scan_i))
                     labels = np.vstack(
                         (labels, np.zeros((points_scan_i.shape[0], 1))))
@@ -277,3 +306,15 @@ class LIDAR:
                         (np.zeros((points_scan_i.shape[0], 1)), np.array([1])[:, np.newaxis]))))
 
         return np.hstack((points, labels))
+
+
+class LIDAR_with_Noise(LIDAR):
+    def __init__(self, fov, r_max, B, noise_std):
+        super().__init__(fov, r_max, B)
+        self.noise_std = noise_std
+
+    def get_laser_ref(self, segments, robot_pose=np.array([0.0, 0.0])):
+        angles, dist_theta = super().get_laser_ref(segments, robot_pose)
+        dist_theta += np.random.normal(0,
+                                       self.noise_std, size=dist_theta.shape)
+        return angles, dist_theta
