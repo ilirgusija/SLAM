@@ -1,6 +1,6 @@
 import numpy as np
 # import cupy as np
-from classes.belief_mdp_n_M import BeliefMDP_n_M
+from ..classes.belief_mdp_n_M import BeliefMDP_n_M
 
 
 class ValueIteration():

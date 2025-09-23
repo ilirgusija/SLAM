@@ -17,9 +17,9 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.animation as animation
 from PIL import Image
-from classes.mapping import LidarGridMap
-from classes.model import LIDAR, VelocityIntegratorModel
-from utils.map import load_obstacles_config
+from src.classes.mapping import LidarGridMap
+from src.classes.model import LIDAR, VelocityIntegratorModel
+from src.utils.map import load_obstacles_config
 
 
 def get_way_points_gui(all_obstacles, area, vehicle_poses=None):

@@ -4,8 +4,7 @@ from scipy import ndimage
 from .model import VelocityIntegratorModel, LIDAR
 from .obstacle import Obstacle
 from .mapping import LidarGridMapVec
-from utils.misc import cartesian, cartesian_dot
-from utils.map import bresenham_vec
+from ..utils.misc import cartesian, cartesian_dot
 
 
 class POMDP:
@@ -23,7 +22,8 @@ class POMDP:
                  obstacles: list[Obstacle],
                  _map: LidarGridMapVec,
                  sigma_w: float = 0.01,
-                 sigma_v: float = 0.01):
+                 sigma_v: float = 0.01,
+                 force_constant: float = 100):
         self.motion_model = motion_model
         self.sensor = measurement_model
         self.obstacles = obstacles
@@ -37,29 +37,10 @@ class POMDP:
         self._map_cache = {}  # Cache for computed map values
         self._integration_cache = {}  # Cache for integration results
         self._component_cache = {}  # Cache for connected components
+        self.force_constant = force_constant
 
     ### 1. Stochastic Kernels #################################
-    def T(self, x, u):
-        """
-        Transition probability for robot position x_1 given x and u.
-        Returns a function that computes T(x_1 | x, u) for given x_1.
-        """
-        def inner(x_1):
-            return 1/(np.sqrt(2 * np.pi) * self.σ_w) * \
-                np.exp(-np.square(x_1 - self.motion_model.simulate(x, u)) /
-                       (2 * self.σ_w ** 2))
-        return inner
-
-    def T(self, x_star, x, u):
-        """
-        Transition probability for robot position x_1 given x and u.
-        Returns a function that computes T(x_1 | x, u) for given x_1.
-        """
-        return 1/(np.sqrt(2 * np.pi) * self.σ_w) * \
-            np.exp(-np.square(x_star - self.motion_model.simulate(x, u)) /
-                   (2 * self.σ_w ** 2))
-
-    def T_cartesian(self, X_n, u):  # ✅
+    def T_vectorized(self, X_n, u):  # ✅
         """
         Vectorized approach using broadcasting for cartesian product.
         More memory efficient for large state spaces.
@@ -90,45 +71,48 @@ class POMDP:
         else:
             squared_diff = squared_diff.squeeze(-1)  # (m_n, m_n)
 
-        # Compute transition probabilities
-        T_matrix = 1/(np.sqrt(2 * np.pi) * self.σ_w) * \
-            np.exp(-squared_diff / (2 * np.square(self.σ_w)))
+        # Compute transition probabilities with numerical stabilization
+        # Subtract per-row minimum squared distance before exponentiation
+        # LogSumExp applied here!
+        variance = np.square(self.σ_w)
+        min_per_row = np.min(squared_diff, axis=1, keepdims=True)  # (m_n,1)
+        stabilized = np.exp(-(squared_diff - min_per_row) / (2 * variance))
 
-        # Normalize each row
-        row_sums = T_matrix.sum(axis=1, keepdims=True)
-        T_matrix = np.where(row_sums > 0, T_matrix / row_sums, T_matrix)
+        # Normalize each row (common factor cancels out)
+        row_sums = stabilized.sum(axis=1, keepdims=True)
+        T_matrix = np.divide(stabilized, row_sums, out=np.zeros_like(
+            stabilized), where=row_sums > 0)
 
-        return T_matrix  # TODO: check if conditional is indexed by row or column
+        return T_matrix
 
-    def Q(self, y, X_n, m):  # ✅
-        """
-        Observation channel for robot observation y given position x, and map m.
-        """
-        m_n = len(X_n)
-        obs = np.array((m_n, self.sensor.B))
-
-        obs = 1/(np.sqrt(2 * np.pi) * self.σ_v) * \
-            np.exp(-np.square(y - self.ray_casting(X_n, m)) /
-                   (2 * self.σ_v ** 2))
-        return obs
-
-    def Q_vectorized(self, Y, X_n, m):  # TODO
+    def Q_vectorized(self, Y, X_n, m):  # ✅ stabilized
         """
         Vectorized observation probability matrix Q(Y | X_n, m).
         Computes observation probabilities for all state-observation pairs in parallel.
         """
         m_n = len(X_n)
-        y_len = len(Y)
+        # Y expected shape: (y_len, B)
+        if Y.ndim == 1:
+            Y = Y[np.newaxis, :]
+        y_len = Y.shape[0]
 
         y_star = self.ray_casting(X_n, m)
-        y_star_expanded = y_star[:, np.newaxis, :]  # (m_n, 1, 1)
-        Y_expanded = Y[np.newaxis, :, :]  # (1, r_len, B)
-        diff = Y_expanded - y_star_expanded  # (1, y_len, m_n, H*W)
-        assert diff.shape == (1, y_len, m_n, m_h_w)
+        y_star_expanded = y_star[:, np.newaxis, :]  # (m_n, 1, B)
+        Y_expanded = Y[np.newaxis, :, :]  # (1, y_len, B)
+        diff = Y_expanded - y_star_expanded  # -> (m_n, y_len, B)
+        assert diff.shape == (m_n, y_len, self.sensor.B)
 
-        Q_matrix = (1/(np.sqrt(2 * np.pi) * self.σ_v) *
-                    np.exp(-np.sum(np.square(diff), axis=-1) / (2 * np.square(self.σ_v)))).squeeze(0)
-        assert Q_matrix.shape == (y_len, m_n, m_h_w)
+        variance = np.square(self.σ_v)
+        squared_diff = np.sum(np.square(diff), axis=-1)  # (m_n, y_len)
+        # LogSumExp-style stabilization across observations per state (row-wise)
+        min_per_row = np.min(squared_diff, axis=1, keepdims=True)  # (m_n,1)
+        stabilized = np.exp(-(squared_diff - min_per_row) /
+                            (2 * variance))  # (m_n, y_len)
+
+        # Normalize each row safely
+        row_sums = stabilized.sum(axis=1, keepdims=True)
+        Q_matrix = np.divide(stabilized, row_sums, out=np.zeros_like(
+            stabilized), where=row_sums > 0)
 
         return Q_matrix
 
@@ -138,7 +122,7 @@ class POMDP:
         """
         Cost function for the POMDP.
         """
-        return self.c_effort(u) + self.c_collision(x, m, u)
+        return self.c_effort(u) + self.c_vff(x, m, u)
 
     @staticmethod
     def c_effort(u):  # ✅
@@ -148,15 +132,15 @@ class POMDP:
         return np.linalg.norm(u, ord=2, axis=1)
 
     def F_r(self, x, m):  # ✅
-        F_cr = 100  # force constant
-        max_D = self.motion_model.dt * self.motion_model.max_v  # (meters)
+        F_cr = self.force_constant  # force constant
+        # max_D = self.motion_model.dt * self.motion_model.max_v  # (meters)
+        max_D = 10.0  # (meters)
 
         # Convert occupancy grid cells to their center positions (N, 2)
-        m_pos = self.map.occupancy_map.get_occupied_map_positions(
-            m)  # (H*W, 2)
+        m_pos = self.map.occupancy_map.get_occupied_map_positions(m)  # (H*W, 2)
 
         # Vector from each cell center to x and corresponding distances (N, 2), (N,)
-        diff = x - m_pos
+        diff = m_pos - x
         d = np.linalg.norm(diff, ord=2, axis=1)
 
         # Mask to keep only cells within max range
@@ -168,7 +152,7 @@ class POMDP:
         d = d[within]
 
         # Avoid divide-by-zero at x coinciding with a cell center
-        eps = 1e-9
+        eps = 1e-6
         inv_d3 = 1.0 / np.maximum(d, eps)**3  # (N,)
 
         # Force contribution: F_cr * (x - m_pos) / d^3  -> (N,2)
@@ -177,15 +161,18 @@ class POMDP:
         # Sum vector force over contributing cells -> (2,)
         return forces.sum(axis=0)
 
-    def c_vff(self, x, m, u):  # 🚧
+    def c_vff(self, x, m, u, ε=1e-6):  # ✅
         """
         Cost function for the collision of the robot with the obstacle.
         """
-        ε = 1e-6
-        F_r = self.F_r(x, m)  # (N_n,2)
-        fraction = np.sum(F_r * u, axis=1) \
-            / (np.linalg.norm(F_r, ord=2, axis=1) + ε)
-        return max(0, fraction)
+        F_r = self.F_r(x, m)  # (2, )
+        print(f"got F_r: {F_r}")
+        print(f"got u: {u}")
+        fraction = np.divide(
+            np.dot(F_r, u),
+            (np.linalg.norm(F_r, ord=2) * np.linalg.norm(u, ord=2) + ε)
+        )
+        return np.maximum(0, fraction)
 
     def c_vff_vectorized(self, X, M, U):  # 🚧
         """
@@ -218,19 +205,9 @@ class POMDP:
         :return y_star: (1, B) array of distances to observed obstacles from robot position x
         """
 
-        # Find connected components of occupied cells
-        connected_components = self._find_connected_components(m)
+        all_obstacle_segments = self._get_obstacles_from_map(m)
 
-        all_obstacle_segments = []
-
-        # Create obstacles for each connected component
-        for component in connected_components:
-            if len(component) > 0:
-                obstacle_segments = self._create_obstacle_from_component(
-                    component)
-                all_obstacle_segments.extend(obstacle_segments)
-
-        _, y_star = self.sensor.get_laser_ref(all_obstacle_segments, X)
+        y_star = self.sensor.get_laser_ref(all_obstacle_segments, X)
 
         return y_star
 
@@ -268,7 +245,7 @@ class POMDP:
         return components
 
     # OPTIMIZE vectorize this
-    def _create_obstacle_from_component(self, component):  # 🚧
+    def _create_obstacle_from_component(self, component):  # ✅
         """
         Create an Obstacle object from a connected component of cells.
 
@@ -296,23 +273,39 @@ class POMDP:
         dx = num_cells_j * cell_size  # width (j direction)
         dy = num_cells_i * cell_size  # height (i direction)
 
-        # Calculate centroid
+        # Calculate centroid at cell centers (account for 0.5 offset)
+        res = self.map.occupancy_map.resolution
+        left_lower = self.map.occupancy_map.left_lower
         if num_cells_i % 2 == 1 and num_cells_j % 2 == 1:
-            # Odd number of cells in both directions - use center cell
+            # Odd number of cells in both directions - use center cell index
             center_i = min_i + num_cells_i // 2
             center_j = min_j + num_cells_j // 2
-            centroid = self.map.occupancy_map.get_position_from_map_index(
-                center_j, center_i)
         else:
-            # Even number of cells - use average of center cells
+            # Even number of cells - use average of center cell indices
             center_i = (min_i + max_i) / 2.0
             center_j = (min_j + max_j) / 2.0
-            centroid = self.map.occupancy_map.get_position_from_map_index(
-                center_j, center_i)
+        # Map (i,j) -> (x,y) using cell center convention: (j+0.5, i+0.5)
+        centroid = left_lower + np.array([center_j + 0.5, center_i + 0.5]) * res
 
         # Create obstacle and get its line segments
         obstacle = Obstacle(centroid, dx=dx, dy=dy, angle=0)
         return obstacle._Obstacle__get_points(centroid)
+
+
+    def _get_obstacles_from_map(self, m):
+        # Find connected components of occupied cells
+        connected_components = self._find_connected_components(m)
+
+        all_obstacle_segments = []
+
+        # Create obstacles for each connected component
+        for component in connected_components:
+            if len(component) > 0:
+                obstacle_segments = self._create_obstacle_from_component(
+                    component)
+                all_obstacle_segments.extend(obstacle_segments)
+        return all_obstacle_segments
+
 
     def generate_space_of_maps(self, method='bit_iteration', callback=None):
         """
@@ -377,3 +370,123 @@ class POMDP:
         else:
             raise ValueError(f"Unknown method: {method}")
 ##########################################################
+    ### 4. Map Space Utilities (bit encoding + symmetries) ###
+
+    def map_to_bits(self, m: np.ndarray) -> int:
+        """
+        Encode an occupancy grid m \in {0,1}^{H\times W} into an integer by row-major bits.
+
+        Bit k corresponds to m.flat[k] (row-major order), with least-significant bit = index 0.
+        """
+        flat = np.asarray(m, dtype=np.uint8).ravel(order='C')
+        bits = 0
+        for idx, v in enumerate(flat):
+            if v:
+                bits |= (1 << idx)
+        return bits
+
+    def bits_to_map(self, bits: int, shape: tuple[int, int]) -> np.ndarray:
+        """
+        Decode integer bits into an occupancy grid of given shape (H,W), row-major.
+        """
+        H, W = shape
+        total = H * W
+        out = np.zeros(total, dtype=np.uint8)
+        for k in range(total):
+            out[k] = (bits >> k) & 1
+        return out.reshape((H, W), order='C')
+
+    def _symmetry_transforms(self, m: np.ndarray) -> list[np.ndarray]:
+        """
+        Generate the 8 dihedral symmetries (D4) of the grid: rotations and flips.
+        """
+        mats = []
+        # Rotations: 0, 90, 180, 270
+        for k in range(4):
+            r = np.rot90(m, k=k)
+            mats.append(r)
+            mats.append(np.fliplr(r))
+        return mats
+
+    def get_canonical_map_representative(self, bits: int, shape: tuple[int, int]) -> int:
+        """
+        Return the minimal integer encoding among all D4 symmetries of the map decoded from bits.
+        """
+        m = self.bits_to_map(bits, shape)
+        candidate_vals = []
+        for t in self._symmetry_transforms(m):
+            candidate_vals.append(self.map_to_bits(t))
+        return min(candidate_vals)
+
+    def generate_unique_maps(self, callback=None):
+        """
+        Iterate over maps, yielding each unique map up to D4 symmetry.
+        If callback is provided: callback(map_bits, map_array) is invoked for each unique map.
+        Returns list of flattened maps if callback is None.
+        """
+        H = self.map.occupancy_map.height
+        W = self.map.occupancy_map.width
+        total_cells = H * W
+        total_maps = 1 << total_cells
+
+        seen = set()
+        if callback is None:
+            out = []
+            for b in range(total_maps):
+                canon = self.get_canonical_map_representative(b, (H, W))
+                if canon in seen:
+                    continue
+                seen.add(canon)
+                out.append(self.bits_to_map(b, (H, W)).flatten())
+            return np.array(out)
+        else:
+            for b in range(total_maps):
+                canon = self.get_canonical_map_representative(b, (H, W))
+                if canon in seen:
+                    continue
+                seen.add(canon)
+                callback(b, self.bits_to_map(b, (H, W)))
+            return None
+
+    def _bitset_min_dtype(self, total_bits: int):
+        """Choose the smallest unsigned integer dtype that can hold total_bits bits.
+        Returns a NumPy dtype or None if >64 bits (use Python int)."""
+        if total_bits <= 8:
+            return np.uint8
+        if total_bits <= 16:
+            return np.uint16
+        if total_bits <= 32:
+            return np.uint32
+        if total_bits <= 64:
+            return np.uint64
+        return None
+
+    def generate_space_of_map_ids(self, as_numpy: bool = True, dtype=None, callback=None):
+        """
+        Generate the map space as compact bitset IDs rather than arrays.
+
+        - If callback is provided: iterate over all IDs and call callback(map_bits) for each.
+        - If as_numpy and total_bits<=64: return a NumPy array of chosen dtype with values [0..2^{HW}-1].
+        - Otherwise: return a Python list of ints.
+        """
+        H = self.map.occupancy_map.height
+        W = self.map.occupancy_map.width
+        total_bits = H * W
+        total_maps = 1 << total_bits
+
+        # Select dtype if not given
+        if dtype is None:
+            dtype = self._bitset_min_dtype(total_bits)
+
+        if callback is not None:
+            # Stream through all IDs without storing
+            for b in range(total_maps):
+                callback(b)
+            return None
+
+        if as_numpy and dtype is not None:
+            # Use vectorized range with chosen dtype
+            return np.arange(total_maps, dtype=dtype)
+
+        # Fallback: Python list of ints (works for any size, but memory heavy)
+        return list(range(total_maps))

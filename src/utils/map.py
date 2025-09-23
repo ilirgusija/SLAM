@@ -1,7 +1,7 @@
 import yaml
 import numpy as np
 import numpy.ma as ma
-from classes.obstacle import Obstacle
+from ..classes.obstacle import Obstacle
 
 
 def load_obstacles_config(environment):

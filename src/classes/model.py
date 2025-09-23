@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from utils.angle import rot_mat_2d
+from ..utils.angle import rot_mat_2d
 
 
 class CarModel:

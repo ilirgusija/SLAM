@@ -1,10 +1,10 @@
 import math
 import numpy as np
 # import cupy as np
-from classes.belief_mdp_n import BeliefMDP_n
-from classes.mapping import LidarGridMapVec
-from classes.model import LIDAR, VelocityIntegratorModel
-from classes.obstacle import Obstacle
+from .belief_mdp_n import BeliefMDP_n
+from .mapping import LidarGridMapVec
+from .model import LIDAR, VelocityIntegratorModel
+from .obstacle import Obstacle
 from .quantizer import reznik_algorithm
 
 

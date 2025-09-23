@@ -1,10 +1,7 @@
-from utils.map import load_obstacles_config
-from classes.mapping import LidarGridMapVec, GridMapNP, OCCUPIED
-from classes.model import VelocityIntegratorModel, LIDAR
+from ..utils.map import load_obstacles_config
+from ..classes.mapping import LidarGridMapVec, GridMapNP, OCCUPIED
+from ..classes.model import VelocityIntegratorModel, LIDAR
 import numpy as np
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 class QLearning:
@@ -24,7 +21,8 @@ class QLearning:
 
     def initialize_true_map(self, all_obstacles, area):
         x_min, x_max, y_min, y_max = area
-        true_map = GridMapNP(x_min, x_max, y_min, y_max, resolution=self.gridmap.resolution, init_val=0.0)
+        true_map = GridMapNP(x_min, x_max, y_min, y_max,
+                             resolution=self.gridmap.resolution, init_val=0.0)
         for obs in all_obstacles:
             # Get rectangle corners in world coordinates
             dx_cos = obs.dx * np.cos(obs.angle)
@@ -72,7 +70,7 @@ class QLearning:
                     if inside:
                         self.true_map.data[x_ind, y_ind] = OCCUPIED
         return true_map
-    
+
     def alpha_t(self, t, x, u):
         return 1/(1+np.sum((self.x_history[:t] == x) & (self.u_history[:t] == u)))
 
@@ -91,7 +89,7 @@ class QLearning:
 
         # --- 2. Map coverage: count cells far from 0.5 (well-explored) ---
         cov_cost = self.coverage_cost(x, u)
-        
+
         # --- 3. Obstacle avoidance: penalize being near occupied cells ---
         obs_cost = self.obstacle_cost(x, u)
 
@@ -108,15 +106,15 @@ class QLearning:
                  w_obstacle * obs_cost +
                  w_control * ctrl_cost)
         return total
-    
+
     def coverage_cost(self, x, u):
         return -np.mean(np.abs(self.gridmap.occupancy_map.data - 0.5))
-    
+
     def estimation_cost(self, x, u):
         grid = self.gridmap.occupancy_map.data  # 2D numpy array
         est_cost = np.mean(np.abs(grid - self.true_map.data))
         return est_cost
-    
+
     def obstacle_cost(self, x, u):
         # --- 3. Obstacle avoidance: penalize being near occupied cells ---
         x_pos, y_pos = x[0], x[1]

@@ -1,13 +1,10 @@
-import sys
 import numpy as np
 import numpy.ma as ma
 from matplotlib import pyplot as plt
 import classes.mapping as mapping
 
-
 def shave_leading_invalid_entries(x):
     return np.split(x.ravel(), (np.stack((np.zeros(x.shape[0], dtype=int), np.argmin(x.mask['f0'], axis=1)), axis=-1) + np.arange(x.shape[0])[:, None] * x.shape[1]).ravel())[2::2]
-
 
 def bresenham_vec(start, ends):
     """
@@ -41,11 +38,10 @@ def bresenham_vec(start, ends):
     ends = ends_swapped
     d = ends - starts  # recalculate differentials
     errors = d[:, 0] // 2  # calculate error
-
+    
     # iterate over bounding box generating points between start and end
     y = starts[:, 1:2].flatten()
-    y_step = np.where(starts[:, 1] < ends[:, 1],
-                      1, -1)[:, np.newaxis].flatten()
+    y_step = np.where(starts[:, 1] < ends[:, 1], 1, -1)[:, np.newaxis].flatten()
     print(f"y_step:\n{y_step}")
 
     lengths = ends[:, 0] - starts[:, 0]
@@ -87,8 +83,8 @@ def test_shaver():
                   [(1, 1), (2, 1), (3, 2)],
                   [(1, 1), (2, 2), (3, 3)]], dtype='i,i')
     x_arr = np.array([[[1, 1], [2, 2], [3, 2]],
-                      [[1, 1], [2, 1], [3, 2]],
-                      [[1, 1], [2, 2], [3, 3]]], dtype='int')
+                  [[1, 1], [2, 1], [3, 2]],
+                  [[1, 1], [2, 2], [3, 3]]], dtype='int')
     # print("Original array:")
     # print(x)
     # print("Shape:", x.shape)
@@ -97,7 +93,7 @@ def test_shaver():
     mask = np.array([[1, 1, 0],  # First row: mask first pair
                      [1, 0, 0],  # Second row: mask first two pairs
                      [0, 0, 0]], dtype=bool)  # Third row: mask all pairs
-
+    
     mask_expanded = np.repeat(mask[:, :, np.newaxis], 2, axis=2)
 
     x = ma.array(x, mask=mask)
@@ -141,10 +137,9 @@ def main():
     # sys.exit()
     x = mapping.FloatGrid(0.5)
     y = 0.5
-    # check size of variable in bytes
+    #check size of variable in bytes 
     print(sys.getsizeof(x))
     print(sys.getsizeof(y))
-
 
 if __name__ == "__main__":
     # main()

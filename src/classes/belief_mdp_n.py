@@ -1,11 +1,10 @@
 import numpy as np
 # import cupy as np
-from classes.mapping import LidarGridMapVec
-from classes.model import LIDAR, VelocityIntegratorModel
-from classes.obstacle import Obstacle
+from .mapping import LidarGridMapVec
+from .model import LIDAR, VelocityIntegratorModel
+from .obstacle import Obstacle
 from .quantizer import StateQuantizer, ActionQuantizer, ObservationQuantizer
 from .pomdp import POMDP
-from utils.misc import cartesian, cartesian_pairs
 
 
 class BeliefMDP_n(POMDP):

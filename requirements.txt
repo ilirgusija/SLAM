@@ -1,6 +1,6 @@
 numpy
 pytest
 matplotlib
-yaml
-PIL
+pyyaml
+pillow
 scikit-learn

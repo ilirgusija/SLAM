@@ -2,7 +2,8 @@ import math
 from collections import deque
 import matplotlib.pyplot as plt
 import numpy as np
-from utils.map import bresenham_vec
+
+from ..utils.map import bresenham_vec
 
 EXTEND_AREA = 1.0
 FREE = 0.0
@@ -551,6 +552,41 @@ class LidarGridMapVec:
         self.xy_resolution = resolution
         self.occupancy_map = GridMapNP(
             x_min, x_max, y_min, y_max, resolution=self.xy_resolution)
+
+    def seed_from_obstacles(self, obstacles):
+        """Rasterize obstacle segments into the occupancy grid as OCCUPIED (1.0)."""
+        # Collect points sampled along each obstacle segment
+        sampled_points = []
+        step = max(self.xy_resolution / 2.0, 1e-3)
+        for obs in obstacles:
+            # Use obstacle geometry at its centroid
+            segments = obs._Obstacle__get_points(obs.centroid)
+            for (x1, y1, x2, y2) in segments:
+                dx = x2 - x1
+                dy = y2 - y1
+                length = (dx**2 + dy**2) ** 0.5
+                n = max(2, int(length / step))
+                ts = np.linspace(0.0, 1.0, n)
+                xs = x1 + ts * dx
+                ys = y1 + ts * dy
+                sampled_points.append(np.stack([xs, ys], axis=1))
+
+        if len(sampled_points) == 0:
+            return
+
+        points = np.vstack(sampled_points)
+
+        # Convert to grid indices with bounds checking
+        left_lower = self.occupancy_map.left_lower
+        res = self.xy_resolution
+        x_inds = np.floor((points[:, 0] - left_lower[0]) / res).astype(int)
+        y_inds = np.floor((points[:, 1] - left_lower[1]) / res).astype(int)
+        valid = (x_inds >= 0) & (x_inds < self.occupancy_map.width) & \
+                (y_inds >= 0) & (y_inds < self.occupancy_map.height)
+        if not np.any(valid):
+            return
+        inds = (x_inds[valid], y_inds[valid])
+        self.occupancy_map.set_values_from_xy_indices(inds, OCCUPIED)
 
     def update_grid_map_vec(self, pos, detections, is_obstacle):
         """

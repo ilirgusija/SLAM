@@ -1,8 +1,8 @@
-from utils.map import load_obstacles_config
-from classes.model import VelocityIntegratorModel, LIDAR
-from classes.mapping import LidarGridMapVec
-from classes.belief_mdp_n_M import BeliefMDP_n_M
-from algorithms.value_iteration import ValueIteration
+from src.utils.map import load_obstacles_config
+from src.classes.model import VelocityIntegratorModel, LIDAR
+from src.classes.mapping import LidarGridMapVec
+from src.classes.belief_mdp_n_M import BeliefMDP_n_M
+from src.algorithms.value_iteration import ValueIteration
 
 
 def run_learning(env='toy1'):

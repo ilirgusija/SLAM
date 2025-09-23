@@ -1,7 +1,4 @@
 import numpy as np
-from sklearn.neighbors import KDTree
-from multiprocessing import Pool
-import itertools
 from scipy.spatial import Voronoi, voronoi_plot_2d
 import matplotlib.pyplot as plt
 
@@ -12,23 +9,24 @@ class SquareLatticeQuantizer:
         self.y_min = y_min
         self.y_max = y_max
         self.n = n
-        self.delta = 1.0 / n  # quantization resolution
+        self.delta_x = (x_max - x_min) / n  # quantization resolution
+        self.delta_y = (y_max - y_min) / n  # quantization resolution
         X_n = self.get_quantized_points()
         self.size = len(X_n)
 
     def get_quantized_points(self):
-        # x_vals = np.arange(self.x_min+self.delta/2, self.x_max + self.delta/2, self.delta)
-        # y_vals = np.arange(self.y_min+self.delta/2, self.y_max + self.delta/2, self.delta)
-        x_vals = np.arange(self.x_min+self.delta/2, self.x_max + self.delta/2, self.delta)
-        y_vals = np.arange(self.y_min+self.delta/2, self.y_max + self.delta/2, self.delta)
+        x_vals = np.arange(self.x_min+self.delta_x/2, self.x_max + self.delta_x/2, self.delta_x)
+        y_vals = np.arange(self.y_min+self.delta_y/2, self.y_max + self.delta_y/2, self.delta_y)
         xv, yv = np.meshgrid(x_vals, y_vals, indexing='xy')
         points = np.stack([xv.ravel(), yv.ravel()], axis=1)
         return points
 
     def quantize(self, x):
-        x = np.array(x)
-        qx = self.delta * np.round(x / self.delta)
-        return qx
+        pos = np.array(x)
+        x, y = pos[0], pos[1]
+        qx = self.delta_x * np.round(x / self.delta_x)
+        qy = self.delta_y * np.round(y / self.delta_y)
+        return np.array([qx, qy])
     
     def quantization_error(self, points):
         """compute mse between original and quantized points"""
@@ -89,7 +87,7 @@ class UniformQuantizer:
         self.delta = (max_val - min_val) / n
     
     def get_quantized_points(self):
-        return np.linspace(self.min_val, self.max_val, self.n)
+        return np.linspace(start=self.min_val, stop=self.max_val, num=self.n)
     
 class ObservationQuantizer(UniformQuantizer):
     """Quantizes the continuous observation space into discrete cells"""
