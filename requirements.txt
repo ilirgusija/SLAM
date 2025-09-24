@@ -1,4 +1,6 @@
 numpy
 pytest
 matplotlib
-yaml
+pyyaml
+pillow
+scikit-learn

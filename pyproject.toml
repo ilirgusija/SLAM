@@ -1,0 +1,41 @@
+[tool.isort]
+profile = "black"
+skip = ["src/test/test_pomdp.py"]
+line_length = 120  # keep isort wrapping consistent
+
+[tool.black]
+line-length = 120
+
+[tool.autopep8]
+max_line_length = 120
+ignore = [
+  "E302",  # no enforced 2 blank lines before top-level defs
+  "E305",  # no enforced 2 blank lines after defs
+  "E303",  # don't collapse/complain about "too many blank lines"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slam"
+version = "0.1.0"
+description = "Research SLAM/POMDP utilities and algorithms (src layout)"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Ilir Gusija" }
+]
+dependencies = [
+  "numpy",
+  "pytest",
+  "matplotlib",
+  "pyyaml",
+  "pillow",
+  "scikit-learn",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["algorithms", "classes", "utils", "script"]

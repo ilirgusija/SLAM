@@ -11,59 +11,15 @@ Output: .csv or carmen file and images
 
 Note: Output file type .csv: column1=time, column2=longitude, column3=latitude, column4=occupied/free
 """
-
 import numpy as np
 import matplotlib.pylab as pl
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import yaml
-from classes.obstacle import Obstacle
-from classes.model import LIDAR, VelocityIntegratorModel
-from classes.mapping import LidarGridMap
-
-
-def load_obstacles_config(environment):
-    """
-    :param environment: name of the yaml config file
-    :return: all obstacles, area of the environment
-    """
-    with open('src/config/'+environment+'.yaml') as file:
-        yaml_data = yaml.load(file, Loader=yaml.FullLoader)
-
-        # load environment area parameters
-        area = yaml_data['area']
-        area = (area['x_min'], area['x_max'], area['y_min'], area['y_max'])
-
-        # load static and dynamic obstacles
-        obs = yaml_data['obstacles']
-        all_obstacles = []
-        for i in range(len(obs)):
-            obs_i = Obstacle(centroid=[obs[i]['centroid_x'], obs[i]['centroid_y']], dx=obs[i]['dx'], dy=obs[i]['dy'],
-                             angle=obs[i]['orientation']*np.pi/180, vel=[obs[i]['velocity_x'], obs[i]['velocity_y']],
-                             acc=[obs[i]['acc_x'], obs[i]['acc_y']])
-            all_obstacles.append(obs_i)
-    return all_obstacles, area
-
-
-def update_text_file(text_file, data, file_format='carmen'):
-    """
-    :param text_file: file created - open(output_file_name, 'w')
-    :param data: dist_theta for carmen; (T,X,Y) numpy array for txy comma-seperated format
-    :param file_format: 'carmen' or 'txy'
-    :return:
-    """
-    if file_format == 'carmen':
-        # http://www2.informatik.uni-freiburg.de/~stachnis/datasets.html
-        data = ''.join(['%f ' % num for num in data])
-        data = 'FLASER 180 ' + data[:-1] + '\n'  # Get rid of the last comma
-    elif file_format == 'txy':
-        data = ''.join(['%f, %f, %f \n' % (t, x, y) for (t, x, y) in data])
-    elif file_format == 'txyout':
-        data = ''.join(['%f, %f, %f, %f\n' % (t, x, y, out)
-                       for (t, x, y, out) in data])
-    else:
-        pass
-    text_file.write(data)
+import matplotlib.animation as animation
+from PIL import Image
+from src.classes.mapping import LidarGridMap
+from src.classes.model import LIDAR, VelocityIntegratorModel
+from src.utils.map import load_obstacles_config
 
 
 def get_way_points_gui(all_obstacles, area, vehicle_poses=None):
@@ -170,11 +126,6 @@ def connect_segments(segments, resolution=0.01):
 
 def create_movie(image_folder, output_filename, fps=10):
     """Create a movie using Matplotlib's animation module."""
-    import matplotlib.pyplot as plt
-    import matplotlib.animation as animation
-    import numpy as np
-    from PIL import Image
-    import os
 
     # Get the list of images in order
     images = [img for img in os.listdir(image_folder)
@@ -200,8 +151,7 @@ def create_movie(image_folder, output_filename, fps=10):
     print(f"Movie saved as {output_filename}")
 
 
-def plot_step(t, gridmap, sensor, robot_pos, laser_data_xy,
-              dist_theta, area, ofn, robot_poses):
+def plot_step(t, gridmap, sensor, robot_pos, laser_data_xy, dist_theta, area, ofn, robot_poses):
     # Define color map for grid visualization
     # 0.0 = free space (white), 0.5 = unknown (grey), 1.0 = obstacle (red)
     grid_cmap = mcolors.ListedColormap(['white', 'grey', 'red'])
@@ -272,7 +222,7 @@ def plot_step(t, gridmap, sensor, robot_pos, laser_data_xy,
 
 
 def run_occupancy_grid_demo(env='toy1', out_fn='toy1_setting1', save_all_data_as_npz=False,
-                            n_reflections=360, fov=180, max_laser_distance=12):
+                            n_reflections=360, fov=180, max_laser_distance=12, resolution=0.02):
     """
     :param env: name of the yaml file inside the config folder
     :param out_fn: name of the output folder - create this folder inside the output folder
@@ -297,7 +247,7 @@ def run_occupancy_grid_demo(env='toy1', out_fn='toy1_setting1', save_all_data_as
     # Initialize our sensor and map objects
     sensor = LIDAR(max_range=max_laser_distance,
                    fov=fov, n_reflections=n_reflections)
-    gridmap = LidarGridMap(*area)
+    gridmap = LidarGridMap(*area, resolution=resolution)
 
     # Loop through each robot pose
     for t in range(len(robot_poses)):
@@ -406,7 +356,7 @@ def run_trajectory_following(waypoints, dt=0.1, max_v=2.0):
 
 
 def run_trajectory_occupancy_grid(trajectory, env='toy1', out_fn='trajectory_following',
-                                  n_reflections=360, fov=360, max_laser_distance=12):
+                                  n_reflections=360, fov=360, max_laser_distance=12, resolution=0.02):
     """
     Generate occupancy grid map from a pre-computed trajectory.
 
@@ -430,7 +380,7 @@ def run_trajectory_occupancy_grid(trajectory, env='toy1', out_fn='trajectory_fol
     # Initialize sensor and map objects
     sensor = LIDAR(max_range=max_laser_distance,
                    fov=fov, n_reflections=n_reflections)
-    gridmap = LidarGridMap(*area)
+    gridmap = LidarGridMap(*area, resolution=resolution)
 
     # Loop through each pose in the trajectory
     for t in range(len(trajectory)):
@@ -468,6 +418,127 @@ def run_trajectory_occupancy_grid(trajectory, env='toy1', out_fn='trajectory_fol
     create_movie(ofn, ofn + out_fn + '_simulation.mp4', fps=10)
 
 
+def occupancy_grid_from_trajectory(trajectory, env, n_reflections, fov, max_laser_distance, resolution, method='sequential'):
+    """
+    Generalized function to run occupancy grid mapping from a trajectory using a specified update method.
+    Args:
+        trajectory: Nx3 array of (x, y, theta) poses
+        env: Name of environment config file
+        n_reflections: Number of lidar beams
+        fov: Field of view in degrees
+        max_laser_distance: Maximum lidar range
+        resolution: Grid resolution
+        method: Update method to use ('sequential', or 'vectorized')
+    Returns:
+        gridmap: The resulting LidarGridMap
+        total_time: Total time taken for the mapping
+    """
+    import time
+    all_obstacles, area = load_obstacles_config(environment=env)
+    fov_rad = fov * np.pi / 180
+    sensor = LIDAR(max_range=max_laser_distance,
+                   fov=fov_rad, n_reflections=n_reflections)
+    gridmap = LidarGridMap(*area, resolution=resolution)
+
+    start_time = time.time()
+    for t in range(len(trajectory)):
+        # Update obstacles
+        all_obstacle_segments = []
+        for obs_i in all_obstacles:
+            all_obstacle_segments += obs_i.update()
+        robot_pos = trajectory[t]
+        angles, dist_theta = sensor.get_laser_ref(
+            all_obstacle_segments, robot_pos)
+        obstacles = np.vstack(
+            [dist_theta * np.cos(angles), dist_theta * np.sin(angles)]).T + robot_pos[:2]
+        is_obstacle = dist_theta < sensor.max_range
+
+        if method == 'vectorized':
+            gridmap.update_grid_map_vec(robot_pos, obstacles, is_obstacle)
+        else:  # sequential
+            gridmap.update_grid_map(robot_pos, obstacles, is_obstacle)
+
+    total_time = time.time() - start_time
+    return gridmap, total_time
+
+
+def run_performance_comparison_trajectory(env='toy1', out_fn='trajectory_test', n_reflections=360, fov=360, max_laser_distance=12, resolution=0.02, batch_sizes=None):
+    """
+    Compare sequential, parallel, and vectorized occupancy grid updates using a real trajectory.
+    """
+    import multiprocessing as mp
+    from math import ceil
+
+    # Generate trajectory
+    waypoints = [
+        (90.0, 5.0),
+        (20.0, 5.0),
+        (20.0, 48.0),
+        (90.0, 48.0),
+        (90.0, 5.0)
+    ]
+    trajectory = run_trajectory_following(waypoints)
+
+    # Sequential
+    print("\nRunning sequential occupancy grid mapping...")
+    gridmap_seq, time_seq = occupancy_grid_from_trajectory(
+        trajectory, env, n_reflections, fov, max_laser_distance, resolution,
+        method='sequential')
+    print(f"Sequential total time: {time_seq:.4f} seconds")
+
+    # Vectorized
+    print("\nRunning vectorized occupancy grid mapping...")
+    gridmap_vec, time_vec = occupancy_grid_from_trajectory(
+        trajectory, env, n_reflections, fov, max_laser_distance, resolution,
+        method='vectorized')
+    speedup_vec = time_seq / time_vec
+    print(f"Vectorized total time: {time_vec:.4f} seconds")
+    print(f"Vectorized speedup: {speedup_vec:.2f}x")
+
+    # Determine batch sizes for parallel version
+    if batch_sizes is None:
+        cpu_count = mp.cpu_count()
+        batch_sizes = [
+            ceil(n_reflections / (cpu_count * 4)),
+            ceil(n_reflections / (cpu_count * 2)),
+            ceil(n_reflections / cpu_count),
+            n_reflections
+        ]
+
+    # Parallel with different batch sizes
+    parallel_results = []
+    for batch_size in batch_sizes:
+        print(
+            f"\nRunning parallel occupancy grid mapping (batch_size={batch_size})...")
+        gridmap_par, time_par = occupancy_grid_from_trajectory(
+            trajectory, env, n_reflections, fov, max_laser_distance, resolution,
+            method='parallel')
+        speedup = time_seq / time_par
+        parallel_results.append((batch_size, time_par, speedup))
+        print(
+            f"Parallel total time: {time_par:.4f} seconds | Speedup: {speedup:.2f}x")
+
+    # Find best parallel configuration
+    best_parallel = min(parallel_results, key=lambda x: x[1])
+    print(f"\nBest parallel configuration:")
+    print(f"Batch size: {best_parallel[0]}")
+    print(f"Time: {best_parallel[1]:.4f} seconds")
+    print(f"Speedup: {best_parallel[2]:.2f}x")
+
+    # Compare best methods
+    print("\nComparison Summary:")
+    print(f"Sequential: {time_seq:.4f} seconds (baseline)")
+    print(f"Vectorized: {time_vec:.4f} seconds ({speedup_vec:.2f}x speedup)")
+    print(
+        f"Best Parallel: {best_parallel[1]:.4f} seconds ({best_parallel[2]:.2f}x speedup)")
+
+    return {
+        'sequential': time_seq,
+        'vectorized': (time_vec, speedup_vec),
+        'parallel': parallel_results
+    }
+
+
 if __name__ == "__main__":
     # file configuration
     env = 'toy1'  # name of the yaml file inside the config folder
@@ -478,6 +549,7 @@ if __name__ == "__main__":
     fov = 360  # lidar field of view in degrees
     n_reflections = fov*2  # number of lidar beams in the 2D plane
     max_laser_distance = 12  # maximum lidar distance in meters
+    resolution = 0.2  # resolution of the occupancy grid
 
     # Example usage of trajectory following
     waypoints = [
@@ -489,18 +561,28 @@ if __name__ == "__main__":
     ]
 
     # Choose which demo to run
-    DEMO_TYPE = "trajectory"  # or "GUI"
+    DEMO_TYPE = "performance"  # "trajectory", "GUI", or "performance"
 
     if DEMO_TYPE == "GUI":
         run_occupancy_grid_demo(env=env, out_fn=out_fn,
                                 save_all_data_as_npz=save_all_data_as_npz,
                                 n_reflections=n_reflections, fov=fov,
-                                max_laser_distance=max_laser_distance)
-    else:
+                                max_laser_distance=max_laser_distance, resolution=resolution)
+    elif DEMO_TYPE == "trajectory":
         # Generate trajectory first
         trajectory = run_trajectory_following(waypoints)
 
         # Then create occupancy grid using the trajectory
         run_trajectory_occupancy_grid(trajectory, env=env, out_fn="trajectory_test",
                                       n_reflections=n_reflections, fov=fov,
-                                      max_laser_distance=max_laser_distance)
+                                      max_laser_distance=max_laser_distance, resolution=resolution)
+    else:
+        # Run performance comparison using trajectory
+        results = run_performance_comparison_trajectory(
+            env=env,
+            out_fn="trajectory_test",
+            n_reflections=n_reflections,
+            fov=fov,
+            max_laser_distance=max_laser_distance,
+            resolution=resolution
+        )
