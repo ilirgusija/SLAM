@@ -1,0 +1,31 @@
+# area of the environment
+area:
+ x_min: 0
+ x_max: 10
+ y_min: 0
+ y_max: 10
+
+#all static and dynamic obstacles 
+obstacles:
+ - # top obj
+  centroid_x: 6.25 # centroid of the obstacle
+  centroid_y: 8.75 # centroid of the obstacle
+  dx: 2.5 # width of the obstacle
+  dy: 2.5 # height of the obstacle
+  orientation: 0 # angle of the obstacle
+  velocity_x: 0 # velocity of the obstacle
+  velocity_y: 0 # velocity of the obstacle
+  acc_x: 0 # acceleration of the obstacle
+  acc_y: 0 # acceleration of the obstacle
+ - # right obj
+  centroid_x: 8.75 # centroid of the obstacle
+  centroid_y: 6.25 # centroid of the obstacle
+  dx: 2.5 # width of the obstacle
+  dy: 2.5 # height of the obstacle
+  orientation: 0 # angle of the obstacle
+  velocity_x: 0 # velocity of the obstacle
+  velocity_y: 0 # velocity of the obstacle
+  acc_x: 0 # acceleration of the obstacle
+  acc_y: 0 # acceleration of the obstacle
+
+ 

@@ -23,7 +23,7 @@ class ValueIteration():
         Run value iteration algorithm.
         """
         Π_n = self.MDP_n.get_codebook()
-        U_n = self.MDP_n.action_quantizer.get_quantized_points()
+        U_n = self.MDP_n.AQ.get_quantized_points()
 
         while self.is_not_converged():
             self.V_old = self.V.copy()
@@ -36,19 +36,19 @@ class ValueIteration():
 
         return self.V
 
-    def run(self): # ✅
+    def run(self):  # ✅
         """
         Run value iteration algorithm.
         """
         Π_n = self.MDP_n.get_codebook()
-        U_n = self.MDP_n.action_quantizer.get_quantized_points()
+        U_n = self.MDP_n.AQ.get_quantized_points()
 
         while self.is_not_converged():
             self.V_old = self.V.copy()
 
             for i, π_t in enumerate(Π_n):
                 q_values = [
-                    self.MDP_n.c_n(π_t, u_t) + 
+                    self.MDP_n.c_n(π_t, u_t) +
                     self.MDP_n.β * self.V @ self.MDP_n.p_n(π_t, u_t).T
                     for u_t in U_n
                 ]

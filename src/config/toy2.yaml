@@ -1,94 +1,49 @@
 # area of the environment
 area:
  x_min: 0
- x_max: 100
+ x_max: 10
  y_min: 0
- y_max: 100
+ y_max: 10
 
 #all static and dynamic obstacles 
 obstacles:
- - # left wall
-  centroid_x: 0 # centroid of the obstacle
-  centroid_y: 50 # centroid of the obstacle
-  dx: 0 # width of the obstacle
-  dy: 100 # height of the obstacle
+ - # top right obj
+  centroid_x: 8.33 # centroid of the obstacle
+  centroid_y: 8.33 # centroid of the obstacle
+  dx: 3.33 # width of the obstacle
+  dy: 3.33 # height of the obstacle
   orientation: 0 # angle of the obstacle
   velocity_x: 0 # velocity of the obstacle
   velocity_y: 0 # velocity of the obstacle
   acc_x: 0 # acceleration of the obstacle
   acc_y: 0 # acceleration of the obstacle
- - # top wall
-  centroid_x: 50 # centroid of the obstacle
-  centroid_y: 100 # centroid of the obstacle
-  dx: 0 # width of the obstacle
-  dy: 100 # height of the obstacle
-  orientation: 90 # angle of the obstacle
-  velocity_x: 0 # velocity of the obstacle
-  velocity_y: 0 # velocity of the obstacle
-  acc_x: 0 # acceleration of the obstacle
-  acc_y: 0 # acceleration of the obstacle
- - # bottom wall
-  centroid_x: 50 # centroid of the obstacle
-  centroid_y: 0 # centroid of the obstacle
-  dx: 0 # width of the obstacle
-  dy: 100 # height of the obstacle
-  orientation: 90 # angle of the obstacle
-  velocity_x: 0 # velocity of the obstacle
-  velocity_y: 0 # velocity of the obstacle
-  acc_x: 0 # acceleration of the obstacle
-  acc_y: 0 # acceleration of the obstacle
- - # right wall
-  centroid_x: 100 # centroid of the obstacle
-  centroid_y: 50 # centroid of the obstacle
-  dx: 0 # width of the obstacle
-  dy: 100 # height of the obstacle
+ - # top left obj
+  centroid_x: 1.67 # centroid of the obstacle
+  centroid_y: 8.33 # centroid of the obstacle
+  dx: 3.33 # width of the obstacle
+  dy: 3.33 # height of the obstacle
   orientation: 0 # angle of the obstacle
   velocity_x: 0 # velocity of the obstacle
   velocity_y: 0 # velocity of the obstacle
   acc_x: 0 # acceleration of the obstacle
   acc_y: 0 # acceleration of the obstacle
- - # wall
-  centroid_x: 50 # centroid of the obstacle
-  centroid_y: 40 # centroid of the obstacle
-  dx: 40 # width of the obstacle
-  dy: 0 # height of the obstacle
-  orientation: 18 # angle of the obstacle
-  velocity_x: 0 # velocity of the obstacle
-  velocity_y: 0 # velocity of the obstacle
-  acc_x: 0 # acceleration of the obstacle
-  acc_y: 0 # acceleration of the obstacle
-
- - #vehicle 1 - move right
-  centroid_x: 40
-  centroid_y: 10
-  dx: 4
-  dy: 2
-  orientation: 0
-  # velocity_x: 0.9
-  velocity_x: 0
-  velocity_y: 0
-  acc_x: 0
-  acc_y: 0
-
- - #vehicle 2 - move down
-  centroid_x: 80
-  centroid_y: 20
-  dx: 2
-  dy: 5
-  orientation: 0 
-  velocity_x: 0
-  # velocity_y: -0.5
-  velocity_y: 0
-  acc_x: 0
-  acc_y: 0
-
- - #vehicle 3 - parked
-  centroid_x: 50
-  centroid_y: 35
-  dx: 4
-  dy: 2
-  orientation: -30
-  velocity_x: 0
-  velocity_y: 0
-  acc_x: 0
-  acc_y: 0
+#  - # top obj
+#   centroid_x: 5 # centroid of the obstacle
+#   centroid_y: 8.33 # centroid of the obstacle
+#   dx: 3.33 # width of the obstacle
+#   dy: 3.33 # height of the obstacle
+#   orientation: 0 # angle of the obstacle
+#   velocity_x: 0 # velocity of the obstacle
+#   velocity_y: 0 # velocity of the obstacle
+#   acc_x: 0 # acceleration of the obstacle
+#   acc_y: 0 # acceleration of the obstacle
+#  - # right obj
+#   centroid_x: 8.33 # centroid of the obstacle
+#   centroid_y: 5 # centroid of the obstacle
+#   dx: 3.33 # width of the obstacle
+#   dy: 3.33 # height of the obstacle
+#   orientation: 0 # angle of the obstacle
+#   velocity_x: 0 # velocity of the obstacle
+#   velocity_y: 0 # velocity of the obstacle
+#   acc_x: 0 # acceleration of the obstacle
+#   acc_y: 0 # acceleration of the obstacle

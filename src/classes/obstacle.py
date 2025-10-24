@@ -5,18 +5,20 @@ class Obstacle():
     Dynamic or static rectangular obstacle. It is assumed that dynamic objects are under constant acceleration.
     E.g. moving vehicle, parked vehicle, wall
     """
-    def __init__(self, centroid, dx, dy, angle=0, vel=[1, 0], acc=[0, 0]):
+    def __init__(self, centroid, dx, dy, angle=0, vel=[0, 0], acc=[0, 0]):
         """
         :param centroid: centroid of the obstacle
         :param dx: length of the vehicle >=0
         :param dy: width of the vehicle >= 0
         :param angle: anti-clockwise rotation from the x-axis
+        :param vel: [x-velocity, y-velocity], put [0,0] for static objects/constant acceleration
         :param acc: [x-acceleration, y-acceleration], put [0,0] for static objects/constant velocity
         """
         self.centroid = centroid
         self.dx = dx
         self.dy = dy
         self.angle = angle
+        self.vel = vel
         self.acc = acc
         self.time = 0 #time is incremented for every self.update() call
 

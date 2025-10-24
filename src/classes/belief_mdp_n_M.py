@@ -1,11 +1,12 @@
 import math
 import numpy as np
+from scipy.spatial.distance import cdist
 # import cupy as np
 from .belief_mdp_n import BeliefMDP_n
 from .mapping import LidarGridMapVec
 from .model import LIDAR, VelocityIntegratorModel
 from .obstacle import Obstacle
-from .quantizer import reznik_algorithm
+from .quantizer import BeliefQuantizer
 
 
 class BeliefMDP_n_M(BeliefMDP_n):
@@ -31,111 +32,294 @@ class BeliefMDP_n_M(BeliefMDP_n):
 
         self.M = M  # controls size and density of belief space
         self.β = β  # discount factor
-        self.N_n = self.state_quantizer.size + \
-            (2 ** self.map.occupancy_map.size)
+        N_n = self.SQ.m_n + self.len_M
 
-        # Initialize reznik algorithm based on import and fix the second and third argument
-        # effectively making it a function of just z
-        self.belief_quantizer = lambda z: reznik_algorithm(z, self.M, self.N_n)
+        # Initialize belief quantizer
+        self.BQ = BeliefQuantizer(M, N_n)
 
-    def p_n(self, π, u):  # ✅
+    def p_n_M(self, u):
         """
-        Quantized transition probability to all beliefs in Π_n given belief π and action u.
+        Quantized transition probability to all beliefs in Π_n_M given belief π and action u.
+
+        p_n_M(π_j^M | π_i^M, u) = η_n(B_j^M | π_i^M, u)
+        where B_j^M is the Voronoi cell around π_j^M.
+
+        Args:
+            π: Current belief (N_n,)
+            u: Action (2,)
+        Returns:
+            Transition probabilities to all quantized beliefs (M,)
         """
-        # assuming ν is dirac on the quantized measures
-        belief = self.η(π, u)  # shape (Π_size, 1)
-        p_n = self.belief_quantizer(belief)
-        return p_n
 
-    def c_n(self, π, u):  # ✅
+        # Compute transition probabilities
+        cardinality = self.BQ.cardinality  # Actual size of belief space
+        p_n_M = np.zeros((cardinality, cardinality))
+
+        for i in range(cardinality):
+            for j in range(cardinality):
+                # p_n_M(π_j^M | π, u) = η_n(B_j^M | π, u)
+                p_n_M[i, j] = self.η_n(j, self.BQ.Π_n_M[i], u)
+
+        return p_n_M
+
+    def p_n_M_parallel(self, actions, n_samples=50000, n_jobs=-1, save_path=None):
         """
-        Cost function for belief-MDP_n with belief π, action u.
+        parallel version using joblib
         """
-        c_n = self.c_tilde(self.belief_quantizer(π), u)
-        return c_n
+        from joblib import Parallel, delayed
 
-    def η(self, π, u, tol=1e-8):  # ✅
+        n_actions = len(actions)
+
+        def compute_row(u_idx, i):
+            """compute entire row P[u_idx, i, :]"""
+            u = actions[u_idx]
+            π_i = self.BQ.Π_n_M[i]
+            cardinality = self.BQ.cardinality
+            row = np.zeros(cardinality)
+            for j in range(cardinality):
+                row[j] = self.η_n(j, π_i, u, n_samples,
+                                  seed=u_idx * cardinality + i)  # deterministic seed
+            return (u_idx, i, row)
+
+        # generate all (u_idx, i) pairs
+        cardinality = self.BQ.cardinality
+        tasks = [(u_idx, i) for u_idx in range(n_actions)
+                 for i in range(cardinality)]
+
+        # parallel computation
+        results = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(compute_row)(u_idx, i) for u_idx, i in tasks
+        )
+
+        # reconstruct matrix
+        cardinality = self.BQ.cardinality
+        P = np.zeros((n_actions, cardinality, cardinality))
+        for u_idx, i, row in results:
+            P[u_idx, i, :] = row
+
+        # normalize
+        for u_idx in range(n_actions):
+            for i in range(cardinality):
+                row_sum = np.sum(P[u_idx, i, :])
+                if row_sum > 0:
+                    P[u_idx, i, :] /= row_sum
+
+        if save_path:
+            np.save(save_path, P)
+
+        return P
+
+    def η_n(self, cell_idx: int, π: np.ndarray, u: np.ndarray, tol=1e-8, n_samples: int = 50000, seed: int = None):  # ✅
         """
-        Transition probability to all beliefs in Π_n given belief π and action u.
-        Returns a vector of size Π_size.
+        ∫ 𝟙_{F(π,u,y)∈B_{cell_idx}} H(dy|π,u) via monte carlo
+
+        args:
+            cell_idx: target voronoi cell index j
+            π: current belief
+            u: action
+            n_samples: number of observation samples
+        Returns:
+            probability of next belief being in cell with index cell_idx
         """
-        Π_n = self.get_codebook()
-        Π_size = len(Π_n.flatten())
+        if seed is not None:
+            np.random.seed(seed)
 
-        # shape ( |R|^B, B, 1) for each permutation of possible measurements (i.e. |R| the size of the discretized range set) from our B beams
-        # could set quantization approach to decay exponentially as we get farther, reflecting the low probability of far detections
-        Y = self.observation_quantizer.get_quantized_points()
+        count = 0
 
-        # find the index of the closest F_vals to π_star using np.isclose
-        idxs = np.array(len(Y), dtype=list)
-        for i, π_star in enumerate(Π_n):
-            for j, y in enumerate(Y):
-                if np.isclose(self.F(π, u, y), π_star, atol=tol):
-                    idxs[i].append(j)
+        for _ in range(n_samples):
+            # sample observation y ~ H(·|π,u)
+            y = self.sample_observation(π, u)
 
-        # compute integral
-        η = np.array(Π_size)
-        for j in range(Π_size):
-            η[j] = np.array([np.sum([self.H(Y[i], π, u)
-                            for i in idx]) for idx in idxs])
-        return η  # shape (Π_size, 1)
+            # compute next belief F(π,u,y)
+            π_new = self.F(π, u, y)
 
-    # TODO: make this iterable, as it stands this is way too big to return an entire array (or is it?)
-    def get_codebook(self):
+            # check if π_new ∈ B_j
+            if self.BQ.is_in_voronoi_cell(π_new, cell_idx):
+                count += 1
+
+        return count / n_samples  # probability of next belief being in cell with index cell_idx
+
+    def η_n_optimized(self, cell_idx: int, π: np.ndarray, u: np.ndarray, n_samples: int = 50000, seed: int = None):
         """
-        Extract codebook by densely sampling simplex and collecting outputs
+        Optimized version of η_n that squashes function calls to reduce overhead.
+
+        This version eliminates the call stack:
+        p_n_M → η_n → sample_observation → H → F → T_n → T → Q
+
+        Instead, it inlines the critical path for maximum performance.
         """
-        # sample densely on (k-1)-simplex
-        card = math.comb(self.M+self.N_n-1, self.N_n-1)  # eq 60
-        Π_n = np.zeros((card, self.N_n))
-        for i in range(card):
-            Π_n[i] = np.random.dirichlet(np.ones(self.N_n), size=1)[0]
-        quantized = [self.belief_quantizer(π_i) for π_i in Π_n]
+        if seed is not None:
+            np.random.seed(seed)
 
-        # extract unique reproduction points
-        codebook = np.unique(np.array(quantized), axis=0)
-        assert codebook.shape[0] == card, "Codebook size mismatch"
-        return codebook
+        count = 0
 
-    # Vectorized methods
-    def p_n_vectorized(self, Π, u):
+        # Precompute frequently used values
+        u_idx = self.AQ.get_quantized_index(u)
+        Tn_mat = self.T_mat[u_idx]  # (m_n, m_n)
+
+        # Precompute predicted belief: Tn_mat @ π
+        integral = Tn_mat @ π  # (m_n, 2^HW)
+
+        # Precompute sensor parameters
+        r_max = self.sensor.r_max
+        B = self.sensor.B
+        n_bins = 20
+
+        for _ in range(n_samples):
+            # INLINED: sample_observation_forward (fastest path)
+            # Sample (x', m) from predicted belief
+            flat_belief = integral.flatten()
+            flat_belief /= np.sum(flat_belief)
+            idx = np.random.choice(len(flat_belief), p=flat_belief)
+
+            x_idx = idx // self.len_M
+            m_idx = idx % self.len_M
+            x_prime = self.SQ.X_n[x_idx]
+            m_2d = self.bits_to_map(m_idx, self.H, self.W)
+
+            # INLINED: sample_from_sensor_model
+            # Sample y from sensor model (deterministic + noise)
+            v = np.random.multivariate_normal(np.zeros(B), self.cov_y)
+            y = self.sensor.g(x_prime, m_2d, v)  # (B,)
+
+            # INLINED: F function (filter update)
+            # Compute observation likelihoods for all (x,m) pairs
+            numerator = np.zeros_like(integral)
+
+            # Vectorized Q computation
+            y_star = self.ray_casting(self.SQ.X_n, m_2d)  # (m_n, B)
+            likelihoods = np.zeros(self.SQ.m_n)
+            for i, y_star_i in enumerate(y_star):
+                likelihoods[i] = mvn.pdf(x=y, mean=y_star_i, cov=self.cov_y)
+
+            # Apply likelihoods to predicted belief
+            numerator[:, m_idx] = likelihoods * integral[:, m_idx]
+
+            # Normalize
+            total = np.sum(numerator)
+            if total > 0:
+                π_new = numerator / total
+            else:
+                π_new = np.ones_like(numerator) / (self.SQ.m_n * self.len_M)
+
+            # INLINED: is_in_voronoi_cell check
+            if self.BQ.is_in_voronoi_cell(π_new, cell_idx):
+                count += 1
+
+        return count / n_samples
+
+    def sample_observation(self, π: np.ndarray, u: np.ndarray):
         """
-        Transition probability for belief-MDP_n with belief pi_1, pi_0 and action u_0.
+        sample y ~ H(·|π,u)
+
+        for continuous observation space [0, r_max]^B, discretize first
         """
-        # assuming ν is dirac on the quantized measures
-        p_n = self.belief_quantizer(self.η_vectorized(Π, u))
-        return p_n
+        r_max = self.sensor.r_max
+        B = self.sensor.B
 
-    def c_n_vectorized(self, Π, U_n):
+        # discretize observation space
+        # each sensor reading in [0, r_max], discretize to n_bins values
+        n_bins = 20  # adjust based on accuracy/speed tradeoff
+
+        # METHOD 1: sample each sensor reading independently (approximate)
+        y = np.zeros(B)
+        for b in range(B):
+            # discretize [0, r_max] for this sensor
+            y_possible = np.linspace(0, r_max, n_bins)
+
+            # compute H(y_b | π, u) for each possible value
+            # this is expensive but unavoidable
+            probs = np.zeros(n_bins)
+            for i, y_val in enumerate(y_possible):
+                # construct full observation with this value for sensor b
+                y_test = np.full(B, r_max)  # default to max range
+                y_test[b] = y_val
+                probs[i] = self.H(y_test, π, u)
+
+            # normalize and sample
+            if np.sum(probs) > 0:
+                probs /= np.sum(probs)
+                y[b] = np.random.choice(y_possible, p=probs)
+            else:
+                y[b] = r_max  # default if all probs zero
+
+        return y
+
+    def sample_observation_forward(self, π, u):
+        """forward sampling version (faster)"""
+
+        # predicted belief
+        u_idx = self.AQ.get_quantized_index(u)  # TODO: Implement this
+        Tn_mat = self.T_mat[u_idx]
+        predicted_belief = Tn_mat @ π
+
+        # sample (x', m)
+        flat_belief = predicted_belief.flatten()
+        flat_belief /= np.sum(flat_belief)
+        idx = np.random.choice(len(flat_belief), p=flat_belief)
+
+        x_idx = idx // self.len_M
+        m_idx = idx % self.len_M
+
+        x_prime = self.SQ.X_n[x_idx]
+        m_2d = self.bits_to_map(m_idx, self.H, self.W)
+
+        # sample y from sensor model
+        y = self.sample_from_sensor_model(x_prime, m_2d)
+
+        return y
+
+    def sample_from_sensor_model(self, x, m):
         """
-        Saldi, 2019, Asymptotic Optimality of Finite Model Approximations for Partially Observed Markov Decision Processes With Discounted Cost
-        Cost function for belief-MDP_n with belief π, action u.
-        This implementation assumes the state space is discrete.
-        c_n(π,u)=\int_{B_i^{(n)}} \\tilde{c}(π,u) \\ν_i^{(self.M)}(dπ)
-        where \\ν_i^{(self.M)} is the weighting measure for the i-th belief. 
+        sample y ~ Q(y|x,m)
+
+        assuming your Q is deterministic raycasting + noise:
+        1. compute expected ranges via raycasting
+        2. add noise
         """
-        c_n = self.c_tilde(
-            Π, U_n)  # assuming ν is dirac on the quantized measures
-        return c_n
+        B = self.sensor.B
+        r_max = self.sensor.r_max
 
-    def η_vectorized(self, Π, u, tol=1e-8):
+        # compute true ranges via raycasting (your Q function does this)
+        # but we need the expected values, not just likelihood
+
+        v = np.random.multivariate_normal(np.zeros(B), self.cov_y)
+        y = self.sensor.g(x, m, v)  # (B,) array
+
+        return y
+
+    def c_n_M(self, π, u):
         """
-        Filter transition probability for belief-MDP given belief pi_0 and action u_0.
-        Returns a vector of size N_n.
+        Quantized cost function for belief-MDP_n_M.
+
+        c_n_M(π^M, u) = c_tilde_n(π^M, u)
+        where π^M is a quantized belief.
+
+        Args:
+            π: Quantized belief (N_n,) - flattened belief vector
+            u: Action (2,)
+        Returns:
+            Cost value
         """
-        Y = self.observation_quantizer.get_quantized_points()
-        F_vals = self.F_vectorized(Π, u, Y)  # (1) run -> p_n -> η -> F
+        # Reshape the flattened belief vector to the expected 2D format
+        # π is (N_n,) where N_n = m_n + 2^(H*W)
+        # We need to split it into state and map components
+        m_n = self.SQ.size
+        H, W = self.map.occupancy_map.height, self.map.occupancy_map.width
+        len_M = 2**(H * W)
 
-        # compare each F(π, u, y) ≈ Π (broadcasted)
-        matches = np.all(np.isclose(F_vals, Π, atol=tol), axis=1)  # shape (k,)
+        # Extract state and map components
+        π_states = π[:m_n]  # First m_n elements
+        π_maps = π[m_n:]    # Remaining elements
 
-        if not np.any(matches):
-            raise ValueError("No observation matched Π")
+        # Reshape to 2D format expected by c_tilde_n
+        π_2d = np.zeros((m_n, len_M))
+        for i in range(m_n):
+            for j in range(len_M):
+                # Map the flattened index to 2D coordinates
+                flat_idx = i * len_M + j
+                if flat_idx < len(π):
+                    π_2d[i, j] = π[flat_idx]
 
-        if matches.sum() > 1:
-            raise ValueError("Multiple observations matched Π")
-
-        idx = np.argmax(matches)  # take first match (you assume deterministic)
-        y_star = Y[idx]
-
-        return self.H_vectorized(y_star, Π, u)  # (2) run -> p_n -> η -> H
+        # Use the quantized cost from the parent class
+        return self.c_tilde_n(π_2d, u)
