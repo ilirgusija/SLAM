@@ -1,7 +1,7 @@
 import math
 from collections import deque
 import matplotlib.pyplot as plt
-import numpy as np
+from ..utils.array_backend import np
 
 from ..utils.map import bresenham_vec
 
@@ -24,8 +24,8 @@ class GridMap:
         self.center_x = (x_max - x_min) / 2
         self.center_y = (y_max - y_min) / 2
 
-        self.width = int((x_max-x_min+1) * 1/self.resolution)
-        self.height = int((y_max-y_min+1) * 1/self.resolution)
+        self.width = int((x_max - x_min + 1) * 1 / self.resolution)
+        self.height = int((y_max - y_min + 1) * 1 / self.resolution)
 
         self.n_data = self.width * self.height
         self.data = [init_val] * self.n_data
@@ -247,20 +247,21 @@ class GridMap:
 
 
 class GridMapNP:
-    def __init__(self, x_min, x_max, y_min, y_max, resolution=1.0,
+    def __init__(self, x_min, x_max, y_min, y_max, quantization_level=5,
                  init_val=0.5):
         """__init__
         :param x_min, x_max, y_min, y_max: positions of extremities of map [m]
-        :param resolution: number of levels of quantization per meter [m]
+        :param quantization_level: number of grid cells per dimension (creates quantization_level x quantization_level grid)
         :param init_val: initial value for all grid cells
         """
         self.left_lower = np.array([x_min, y_min])
         self.right_upper = np.array([x_max, y_max])
-        self.resolution = resolution
+        self.quantization_level = quantization_level
+        self.resolution = (x_max - x_min) / quantization_level  # Calculate actual cell size
         self.center = np.array([(x_max - x_min) / 2, (y_max - y_min) / 2])
 
-        self.width = int((x_max-x_min+1) * 1/self.resolution)
-        self.height = int((y_max-y_min+1) * 1/self.resolution)
+        self.width = quantization_level
+        self.height = quantization_level
 
         self.data = np.full((self.width, self.height),
                             init_val, dtype=type(init_val))
@@ -328,6 +329,130 @@ class GridMapNP:
         ij = np.argwhere(grid != 0)         # (K, 2) with (i, j) = (row, col)
         xy = ij[:, [1, 0]]                  # reorder to (x=j, y=i)
         return self.left_lower + (xy + 0.5) * self.resolution
+
+    def get_occupied_map_positions_batched(self, grids):
+        """
+        Fully vectorized batched version that processes multiple maps at once.
+
+        Uses advanced indexing and sorting to eliminate Python loops.
+
+        Args:
+            grids: Array of shape (n_m, H, W) - multiple occupancy grids
+        Returns:
+            positions: Array of shape (n_m, max_occupied, 2) - padded positions
+            valid_mask: Array of shape (n_m, max_occupied) - boolean mask indicating valid entries
+        """
+        if grids.ndim == 2:
+            grids = grids[np.newaxis, :, :]  # (1, H, W)
+
+        n_m, H, W = grids.shape
+
+        # Vectorized approach: find all occupied cells across all maps
+        # Create coordinate grids: ii: rows (y/i), jj: cols (x/j)
+        ii, jj = np.indices((H, W))  # (H, W), (H, W)
+
+        # Broadcast to all maps: (1, H, W) -> (n_m, H, W)
+        ii_broadcast = np.broadcast_to(ii[np.newaxis, :, :], (n_m, H, W))  # (n_m, H, W)
+        jj_broadcast = np.broadcast_to(jj[np.newaxis, :, :], (n_m, H, W))  # (n_m, H, W)
+
+        # Find occupied cells: (n_m, H, W) boolean
+        occupied = grids != 0  # (n_m, H, W)
+
+        # Count occupied cells per map: (n_m,)
+        counts_per_map = np.sum(occupied, axis=(1, 2))  # (n_m,)
+        max_occupied = int(np.max(counts_per_map))
+
+        if max_occupied == 0:
+            # No occupied cells in any map
+            return np.zeros((n_m, 1, 2), dtype=np.float32), np.zeros((n_m, 1), dtype=bool)
+
+        # Flatten for easier indexing: (n_m, H*W)
+        occupied_flat = occupied.reshape(n_m, H * W)  # (n_m, H*W)
+        ii_flat = ii_broadcast.reshape(n_m, H * W)  # (n_m, H*W)
+        jj_flat = jj_broadcast.reshape(n_m, H * W)  # (n_m, H*W)
+
+        # Create map indices for grouping: (n_m, H*W)
+        map_indices = np.broadcast_to(np.arange(n_m)[:, np.newaxis], (n_m, H * W))  # (n_m, H*W)
+
+        # Flatten everything: (n_m * H * W,)
+        occupied_all = occupied_flat.flatten()  # (n_m * H * W,)
+        ii_all = ii_flat.flatten()  # (n_m * H * W,)
+        jj_all = jj_flat.flatten()  # (n_m * H * W,)
+        map_indices_all = map_indices.flatten()  # (n_m * H * W,)
+
+        # Get indices of all occupied cells across all maps
+        occupied_idx = np.where(occupied_all)[0]  # (total_occupied,)
+
+        if len(occupied_idx) == 0:
+            return np.zeros((n_m, 1, 2), dtype=np.float32), np.zeros((n_m, 1), dtype=bool)
+
+        # Extract coordinates for occupied cells: (total_occupied,)
+        i_occupied = ii_all[occupied_idx]  # (total_occupied,)
+        j_occupied = jj_all[occupied_idx]  # (total_occupied,)
+        map_idx_occupied = map_indices_all[occupied_idx]  # (total_occupied,)
+
+        # Convert to world coordinates: (total_occupied, 2)
+        xy = np.stack([j_occupied, i_occupied], axis=1)  # (total_occupied, 2)
+        world_positions = self.left_lower + (xy + 0.5) * self.resolution  # (total_occupied, 2)
+
+        # Now we need to group by map and pad to max_occupied
+        # Sort by map index to group together
+        sort_idx = np.argsort(map_idx_occupied)
+        sorted_map_idx = map_idx_occupied[sort_idx]  # (total_occupied,)
+        sorted_positions = world_positions[sort_idx]  # (total_occupied, 2)
+
+        # Find boundaries between maps using vectorized operations
+        # First entry of each map is where map_idx changes
+        if len(sorted_map_idx) > 1:
+            map_changes = np.concatenate((np.array([True]), sorted_map_idx[1:] != sorted_map_idx[:-1]))
+        else:
+            map_changes = np.array([True])
+
+        # Get start and end indices for each map using vectorized operations
+        # Find where each map starts in the sorted array
+        change_indices = np.where(map_changes)[0]  # (n_m_actual,) - indices where maps start
+        change_map_ids = sorted_map_idx[change_indices]  # (n_m_actual,) - which map starts at each index
+
+        # Create mapping from map_id to start index: (n_m,)
+        map_start_indices = np.full(n_m, len(sorted_positions), dtype=np.int32)  # Initialize to end
+        if len(change_indices) > 0:
+            map_start_indices[change_map_ids] = change_indices
+
+        # Get end indices: start of next map, or end of array
+        # Sort change_indices to get sequential order
+        if len(change_indices) > 0:
+            sorted_change_idx = np.argsort(change_map_ids)
+            sorted_change_positions = change_indices[sorted_change_idx]
+            sorted_change_maps = change_map_ids[sorted_change_idx]
+
+            # End index is start of next map (or end of array)
+            map_end_indices = np.full(n_m, len(sorted_positions), dtype=np.int32)
+            for i in range(len(sorted_change_positions) - 1):
+                map_idx = sorted_change_maps[i]
+                map_end_indices[map_idx] = sorted_change_positions[i + 1]
+            # Last map ends at end of array (already set)
+        else:
+            map_end_indices = np.full(n_m, len(sorted_positions), dtype=np.int32)
+
+        # Create output arrays: (n_m, max_occupied, 2)
+        positions = np.zeros((n_m, max_occupied, 2), dtype=np.float32)
+        valid_mask = np.zeros((n_m, max_occupied), dtype=bool)
+
+        # Use advanced indexing to fill all maps at once
+        # Create a flat index array that maps from sorted_positions to output array
+        # This is tricky because each map has different length, so we need per-map assignment
+        # The loop here is O(n_m) which is typically small, but we can't easily vectorize
+        # variable-length assignments to different rows
+        for j in range(n_m):
+            start_idx = map_start_indices[j]
+            end_idx = map_end_indices[j]
+            K_j = end_idx - start_idx
+
+            if K_j > 0 and K_j <= max_occupied:
+                positions[j, :K_j, :] = sorted_positions[start_idx:end_idx]
+                valid_mask[j, :K_j] = True
+
+        return positions, valid_mask
 
     # Setters##################################################################
     def set_value_from_pos(self, pos, val):
@@ -548,16 +673,16 @@ class LidarGridMap:
 
 
 class LidarGridMapVec:
-    def __init__(self, x_min, x_max, y_min, y_max, resolution=0.02):
-        self.xy_resolution = resolution
+    def __init__(self, x_min, x_max, y_min, y_max, quantization_level=5):
+        self.quantization_level = quantization_level
         self.occupancy_map = GridMapNP(
-            x_min, x_max, y_min, y_max, resolution=self.xy_resolution)
+            x_min, x_max, y_min, y_max, quantization_level=self.quantization_level)
 
     def seed_from_obstacles(self, obstacles):
         """Rasterize obstacle segments into the occupancy grid as OCCUPIED (1.0)."""
         # Collect points sampled along each obstacle segment
         sampled_points = []
-        step = max(self.xy_resolution / 2.0, 1e-3)
+        step = max(self.occupancy_map.resolution / 2.0, 1e-3)
         for obs in obstacles:
             # Use obstacle geometry at its centroid
             segments = obs._Obstacle__get_points(obs.centroid)
@@ -578,7 +703,7 @@ class LidarGridMapVec:
 
         # Convert to grid indices with bounds checking
         left_lower = self.occupancy_map.left_lower
-        res = self.xy_resolution
+        res = self.occupancy_map.resolution
         x_inds = np.floor((points[:, 0] - left_lower[0]) / res).astype(int)
         y_inds = np.floor((points[:, 1] - left_lower[1]) / res).astype(int)
         valid = (x_inds >= 0) & (x_inds < self.occupancy_map.width) & \

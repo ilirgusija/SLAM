@@ -1,4 +1,4 @@
-import numpy as np
+from ..utils.array_backend import np
 from scipy.spatial.transform import Rotation as Rot
 
 

@@ -1,29 +1,85 @@
-import numpy as np
-import pytest
-import matplotlib.pyplot as plt
+from src.utils.metrics import tvd, W1_m, W1_state_simple
+from src.classes.belief_mdp_n import BeliefMDP_n
+from src.classes.model import SingleIntegratorModel, LIDAR
+from src.classes.mapping import LidarGridMapVec
+from src.utils.map import load_obstacles_config
 import sys
+import matplotlib.pyplot as plt
+import pytest
+import os
+import time
+import numpy as np
+
+# Ensure Numba is enabled by default in CI; individual tests will toggle
+os.environ.setdefault("SLAM_USE_NUMBA", "1")
+
+
+def test_belief_quantizer_codebook_equivalence():
+    from src.classes.quantizer import BeliefQuantizer
+    from math import comb
+
+    M = 6
+    N_n = 4
+    cardinality = comb(M + N_n - 1, N_n - 1)
+
+    # Reference (numpy+itertools) implementation
+    bq_ref = BeliefQuantizer(M, N_n)
+    codebook_ref = bq_ref._generate_codebook_fast()
+
+    # Numba-clean static function
+    codebook_numba = BeliefQuantizer._generate_codebook_numba_clean(cardinality, M, N_n)
+
+    # Same shape and same elements (order may differ; sort rows for comparison)
+    assert codebook_ref.shape == codebook_numba.shape
+    ref_sorted = np.sort(codebook_ref, axis=1)
+    numba_sorted = np.sort(codebook_numba, axis=1)
+    # Sort rows lexicographically
+    ref_rows = np.array(sorted(ref_sorted.tolist()))
+    numba_rows = np.array(sorted(numba_sorted.tolist()))
+    np.testing.assert_allclose(ref_rows, numba_rows, atol=0, rtol=0)
+
+
+def test_belief_quantizer_codebook_perf_smoke():
+    from src.classes.quantizer import BeliefQuantizer
+    from math import comb
+
+    M = 7
+    N_n = 5
+    cardinality = comb(M + N_n - 1, N_n - 1)
+
+    # Warm-up JIT if enabled
+    _ = BeliefQuantizer._generate_codebook_numba_clean(cardinality, M, N_n)
+
+    # Time both versions
+    t0 = time.time()
+    codebook_ref = BeliefQuantizer(M, N_n)._generate_codebook_fast()
+    t1 = time.time()
+    codebook_numba = BeliefQuantizer._generate_codebook_numba_clean(cardinality, M, N_n)
+    t2 = time.time()
+
+    # Sanity: same cardinality
+    assert codebook_ref.shape == codebook_numba.shape
+
+    # Print for visibility in test logs
+    print(f"codebook_fast: {t1 - t0:.4f}s, numba_clean: {t2 - t1:.4f}s")
+
 try:
     from tqdm.auto import tqdm  # better auto-detection for terminals/notebooks
 except Exception:
     tqdm = None
 
-from src.utils.map import load_obstacles_config
-from src.classes.quantizer import SquareLatticeQuantizer
-from src.classes.mapping import LidarGridMapVec
-from src.classes.model import VelocityIntegratorModel, LIDAR
-from src.classes.belief_mdp_n import BeliefMDP_n
-from src.utils.metrics import tvd, W1_m, W1_state_simple
 
 
 def _init_belief_mdp_n(n_m: int = 3) -> BeliefMDP_n:
     all_obstacles, area = load_obstacles_config(environment='toy2')
-    motion_model = VelocityIntegratorModel(i_x=5.0, i_y=5.0, dt=0.1, max_v=5)
+    motion_model = SingleIntegratorModel(i_x=5.0, i_y=5.0, dt=0.1, max_v=5)
     sensor = LIDAR(fov=360, r_max=5, B=8)
-    world_res = (area[1] - area[0] + 1) / n_m
+    # LidarGridMapVec uses quantization_level parameter
+    quantization_level = n_m
     grid_map = LidarGridMapVec(
         x_min=area[0], x_max=area[1],
         y_min=area[2], y_max=area[3],
-        resolution=world_res,
+        quantization_level=quantization_level,
     )
     belief_mdp_n = BeliefMDP_n(
         n=11,
@@ -74,8 +130,9 @@ def validate_basic_properties():
     u = np.array([0.0, 0.0])
     y = np.ones((1, bmdp.sensor.B)) * bmdp.sensor.r_max / 2
 
-    # T shape
-    T_n = bmdp.T_vectorized(X_n, u)
+    # T shape - now using T_mat directly
+    u_idx = bmdp.AQ.get_quantized_index(u)
+    T_n = bmdp.T_mat[:, :, u_idx]  # Extract transition matrix for action u
     assert T_n.shape == (m_n, m_n)
 
     # Integral shape
@@ -679,8 +736,9 @@ def test_T_vectorized_vs_motion_model_f():
         x_samples.append(x_next)
     x_samples = np.array(x_samples)
 
-    # Get T_vectorized prediction for this state
-    T_matrix = bmdp.T_vectorized(X_n, u)
+    # Get T_mat prediction for this state
+    u_idx = bmdp.AQ.get_quantized_index(u)
+    T_matrix = bmdp.T_mat[:, :, u_idx]  # Extract transition matrix for action u
     T_row = T_matrix[X_ind, :]  # Transition probabilities from x_test
 
     # Find the most likely next states according to T_vectorized
@@ -692,16 +750,16 @@ def test_T_vectorized_vs_motion_model_f():
     print(f"True mean & std: {x_test}, {bmdp.σ_w}")
 
 
-    # Check if sample mean is close to predicted mean from T_vectorized
+    # Check if sample mean is close to predicted mean from T_mat
     predicted_mean = np.sum(X_n * T_row[:, np.newaxis], axis=0)
-    print(f"T_vectorized predicted mean: {predicted_mean}")
+    print(f"T_mat predicted mean: {predicted_mean}")
 
-    # Compute correlation between sample distribution and T_vectorized
+    # Compute correlation between sample distribution and T_mat
     # Create histogram of samples
     bins = np.linspace(X_n[:, 0].min(), X_n[:, 0].max(), 20)
     hist_x, _ = np.histogram(x_samples[:, 0], bins=bins, density=True)
 
-    # Get T_vectorized probabilities for these bins
+    # Get T_mat probabilities for these bins
     bin_centers = (bins[:-1] + bins[1:]) / 2
     T_probs_x = np.zeros(len(bin_centers))
     for i, bin_center in enumerate(bin_centers):
@@ -733,7 +791,7 @@ def test_T_vectorized_vs_motion_model_f():
     # Assert reasonable correlation
     assert corr_x > 0.5, f"X-component correlation too low: {corr_x:.4f}"
     assert corr_y > 0.5, f"Y-component correlation too low: {corr_y:.4f}"
-    print(f"T_vectorized correlation: {corr_x:.4f}, {corr_y:.4f}")
+    print(f"T_mat correlation: {corr_x:.4f}, {corr_y:.4f}")
 
 
 def test_Q_vectorized_vs_lidar_g():
@@ -888,8 +946,9 @@ def test_H_monte_carlo_debug():
         # For each observation, compute likelihood manually
         # This should match what H does internally
 
-        # Get T_vectorized
-        T_n = bmdp.T_vectorized(X_n, u)
+        # Get T_mat
+        u_idx = bmdp.AQ.get_quantized_index(u)
+        T_n = bmdp.T_mat[:, :, u_idx]  # Extract transition matrix for action u
 
         # Apply transition to belief
         integral = T_n @ π  # (m_n, M_size)
@@ -925,6 +984,67 @@ def test_H_monte_carlo_debug():
 
 def test_validate_basic_properties():
     validate_basic_properties()
+
+
+def test_T_mat_structure():
+    """Test that T_mat has correct structure and can be accessed via T_n()."""
+    bmdp = _init_belief_mdp_n()
+
+    # Test T_n() returns full T_mat
+    T_n_result = bmdp.T_n()
+    assert T_n_result.shape == (bmdp.SQ.m_n, bmdp.SQ.m_n, bmdp.AQ.n_u)
+
+    # Verify it's the same as T_mat
+    assert np.array_equal(T_n_result, bmdp.T_mat)
+
+    # Test probability properties for all actions
+    for k in range(bmdp.AQ.n_u):
+        T_for_action = bmdp.T_mat[:, :, k]
+        col_sums = T_for_action.sum(axis=0)
+        assert np.allclose(col_sums, 1.0, atol=1e-10), f"Action {k}: columns should sum to 1"
+
+    print("✓ T_mat structure validation passed")
+
+
+def test_T_mat_caching():
+    """Test that T_mat is cached and reused correctly."""
+    import shutil
+    from pathlib import Path
+    import time
+
+    # Clean cache before test
+    project_root = Path(__file__).parent.parent
+    cache_dir = project_root / "cache/T_mat"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+
+    # First instantiation - should compute
+    start_time = time.time()
+    bmdp1 = _init_belief_mdp_n()
+    first_time = time.time() - start_time
+    print(f"First computation time: {first_time:.2f}s")
+
+    # Verify cache file exists
+    assert cache_dir.exists(), "Cache directory should exist"
+    cache_files = list(cache_dir.glob("T_mat*.npz"))
+    assert len(cache_files) > 0, "Cache file should be created"
+
+    # Second instantiation - should load from cache
+    start_time = time.time()
+    bmdp2 = _init_belief_mdp_n()
+    second_time = time.time() - start_time
+    print(f"Cache load time: {second_time:.2f}s")
+    print(f"Speedup: {first_time / second_time:.1f}x")
+
+    # Verify results are identical
+    assert np.allclose(bmdp1.T_mat, bmdp2.T_mat)
+
+    # Cache load should be faster
+    assert second_time < first_time
+
+    # Clean up
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
 
 
 @pytest.mark.parametrize("N", [10])

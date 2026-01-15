@@ -1,11 +1,11 @@
 import time
-from src.utils.map import load_obstacles_config
-from src.classes.quantizer import SquareLatticeQuantizer, ObservationQuantizer
-from src.classes.mapping import LidarGridMapVec
-from src.classes.model import VelocityIntegratorModel, LIDAR
-from src.classes.pomdp import POMDP
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
+from src.utils.map import load_obstacles_config
+from src.classes.quantizer import SquareLatticeQuantizer
+from src.classes.mapping import OCCUPIED, LidarGridMapVec
+from src.classes.model import SingleIntegratorModel, LIDAR
+from src.classes.pomdp import POMDP
 
 # 1. Initialization
 def test_pomdp_initialization_3x3():
@@ -20,7 +20,7 @@ def test_pomdp_initialization_3x3():
     print(f"Area: {area}")
 
     # Create motion model
-    motion_model = VelocityIntegratorModel(
+    motion_model = SingleIntegratorModel(
         i_x=5.0, i_y=5.0, dt=0.1, max_v=5)
     print(f"Motion model: {motion_model.x}")
 
@@ -32,8 +32,7 @@ def test_pomdp_initialization_3x3():
     map = LidarGridMapVec(
         x_min=area[0], x_max=area[1],
         y_min=area[2], y_max=area[3],
-        # since n = (x_max-x_min+1)/resolution
-        resolution=(area[1] - area[0] + 1) / (n_m)
+        quantization_level=n_m
     )
     print(f"Map: {map.occupancy_map.width}x{map.occupancy_map.height} cells")
     print(f"Map size: {map.occupancy_map.size} cells")
@@ -69,7 +68,7 @@ def test_pomdp_initialization_4x4():
     print(f"Area: {area}")
 
     # Create motion model
-    motion_model = VelocityIntegratorModel(
+    motion_model = SingleIntegratorModel(
         i_x=5.0, i_y=5.0, dt=0.1, max_v=5)
     print(f"Motion model: {motion_model.x}")
 
@@ -81,8 +80,7 @@ def test_pomdp_initialization_4x4():
     map = LidarGridMapVec(
         x_min=area[0], x_max=area[1],
         y_min=area[2], y_max=area[3],
-        # since n = (x_max-x_min+1)/resolution
-        resolution=(area[1] - area[0] + 1) / (n_m)
+        quantization_level=n_m
     )
     print(f"Map: {map.occupancy_map.width}x{map.occupancy_map.height} cells")
     print(f"Map size: {map.occupancy_map.size} cells")
@@ -106,257 +104,91 @@ def test_pomdp_initialization_4x4():
 
     return pomdp
 
-# 2. Transition model
-def test_vectorized_transition(pomdp):
-    """Test cartesian transition matrix calculation"""
-    print("\n=== Testing Cartesian Transition Matrix ===")
+# 2. Transition model - REMOVED obsolete T_vectorized tests
+def test_visualize_transition_probabilities(pomdp):
+    """Visualize transition probabilities P(x_{t+1} | x_t, u) as heatmap over state space."""
+    print("\n=== Visualizing Transition Probabilities ===")
 
-    # Create a small set of states for testing
-    X_n = SquareLatticeQuantizer(0, 3, 0, 3, n=10).get_quantized_points()
-    u = np.array([0.5, 0.3])
+    # Create a quantized state space for visualization
+    from src.classes.quantizer import SquareLatticeQuantizer
+    X_n = SquareLatticeQuantizer(0, 5, 0, 5, n=11).get_quantized_points()  # 11x11 = 121 states
 
-    print(f"Testing transition matrix for {len(X_n)} states")
-    print(f"States: {X_n}")
-    print(f"Action: {u}")
+    # Pick initial state (center)
+    x_initial = np.array([2.5, 2.5])
+    x_idx = np.argmin(np.linalg.norm(X_n - x_initial, axis=1))
+    x_start = X_n[x_idx]
 
-    start_time = time.time()
-    T_matrix = pomdp.T_vectorized(X_n, u)
-    end_time = time.time()
+    # Define control action (northeast movement)
+    u = np.array([1.0, 1.0])
 
-    print(f"Transition matrix calculation time: {end_time - start_time:.4f}s")
-    print(f"Transition matrix shape: {T_matrix.shape}")
-    print(f"Transition matrix:\n{T_matrix}")
+    print(f"Initial state: {x_start}")
+    print(f"Control action: {u}")
 
-    # Verify properties
-    row_sums = np.sum(T_matrix, axis=1)
-    print(f"Row sums (should be close to 1): {row_sums}")
+    # Compute transition probabilities using POMDP T method
+    # We need to use the T method with Borel sets for each state
+    transition_probs = np.zeros(len(X_n))
 
-    # Verify properties
-    col_sums = np.sum(T_matrix, axis=0)
-    print(f"Column sums (should not be close to 1): {col_sums}")
+    # For each possible next state, compute P(x_next | x_start, u)
+    for i, x_next in enumerate(X_n):
+        # Create a small Borel set around x_next
+        delta = 0.1  # Small region around each state
+        B = np.array([
+            [x_next[0] - delta, x_next[0] + delta],  # x bounds
+            [x_next[1] - delta, x_next[1] + delta]  # y bounds
+        ])
 
-    return T_matrix
+        # Compute T(B | x_start, u)
+        prob = pomdp.T(B, x_start[np.newaxis, :], u)[0]
+        transition_probs[i] = prob
 
+    # Normalize to ensure it's a probability distribution
+    transition_probs = transition_probs / np.sum(transition_probs)
 
-def test_T_vectorized_indexing_validation(pomdp):
-    """Validate that row i corresponds to T(\cdot | X_n[i]) and column j to next state X_n[j]."""
-    print("\n=== Validating T_vectorized Indexing (rows: current i, cols: next j) ===")
-
-    # Tiny grid of states and a fixed action
-    X_n = np.array([
-        [0.0, 0.0],
-        [1.0, 0.0],
-        [0.0, 1.0],
-    ])
-    u = np.array([0.5, 0.3])
-
-    # Compute vectorized transition matrix
-    T_vec = pomdp.T_vectorized(X_n, u)
-
-    # Manually compute expected matrix using the definition with a loop baseline
-    dt = pomdp.motion_model.dt
-    sigma = pomdp.σ_w
-    var = sigma ** 2
-    norm_const = 1.0 / (np.sqrt(2 * np.pi) * sigma)
-
-    predicted_states = X_n + u * dt  # shape (m,2)
-    m = X_n.shape[0]
-    T_loop = np.zeros((m, m))
-    for i in range(m):  # current state index
-        for j in range(m):  # next state index
-            diff = X_n[j] - predicted_states[i]
-            sq = np.dot(diff, diff)
-            T_loop[i, j] = norm_const * np.exp(-sq / (2 * var))
-        # row-normalize to compare fairly
-        row_sum = T_loop[i].sum()
-        if row_sum > 0:
-            T_loop[i] /= row_sum
-
-    print("T_vec:\n", T_vec)
-    print("T_loop baseline:\n", T_loop)
-
-    # The two should match closely if indexing is T(j | i)
-    assert np.allclose(
-        T_vec, T_loop, atol=1e-10), "Row/column indexing mismatch in T_vectorized"
-
-    # Additionally check that the most likely next state per row aligns with nearest neighbor to predicted state
-    nn_indices = np.argmin(
-        ((X_n[None, :, :] - predicted_states[:, None, :]) ** 2).sum(axis=-1), axis=1)
-    argmax_cols = np.argmax(T_vec, axis=1)
-    print("Nearest-neighbor indices per row:", nn_indices)
-    print("Argmax columns per row:", argmax_cols)
-    assert np.array_equal(
-        argmax_cols, nn_indices), "Highest probability column should be nearest to predicted state per row"
-
-    return T_vec, T_loop
-
-
-def test_compare_T_vectorized_versions(pomdp):
-    """Compare T_vectorized (new) vs T_vectorized_v1 (old) on identical inputs."""
-    print("\n=== Comparing T_vectorized vs T_vectorized_v1 ===")
-
-    # Use a modest grid to keep runtime reasonable but non-trivial
-    X_n = SquareLatticeQuantizer(0, 3, 0, 3, n=9).get_quantized_points()
-    u = np.array([0.7, -0.2])
-
-    T_new = pomdp.T_vectorized(X_n, u)
-    T_old = pomdp.T_vectorized_v1(X_n, u)
-
-    print("Shapes:", T_new.shape, T_old.shape)
-    # Row sums should be ~1 for both
-    print("Row sums (new) sample:", np.round(T_new.sum(axis=1)[:5], 6))
-    print("Row sums (old) sample:", np.round(T_old.sum(axis=1)[:5], 6))
-
-    # Numerical agreement: allow tiny tolerance due to different stabilization strategies
-    assert T_new.shape == T_old.shape
-    assert np.allclose(T_new, T_old, atol=1e-8, rtol=1e-5), "New and old T diverge beyond tolerance"
-
-    # Argmax column per row (most likely next state) should match exactly
-    argmax_new = np.argmax(T_new, axis=1)
-    argmax_old = np.argmax(T_old, axis=1)
-    assert np.array_equal(argmax_new, argmax_old), "Argmax next-state columns differ between versions"
-
-    return T_new, T_old
-
-
-def demonstrate_T_vectorized_broadcasting(pomdp):
-    """Demonstrate the broadcasting steps used to build T_vectorized with a tiny example."""
-    print("\n=== Demonstrating T_vectorized Broadcasting Shapes ===")
-
-    # X_n = np.array([
-    #     [0.0, 0.0],
-    #     [1.0, 0.0],
-    #     [0.0, 1.0],
-    # ])
-    X_n = SquareLatticeQuantizer(0, 3, 0, 3, n=4).get_quantized_points()
-    u = np.array([3, 3])
-
-    predicted_states = pomdp.motion_model.simulate(X_n, u)
-    predicted_expanded = predicted_states[:, np.newaxis, :]
-    X_n_expanded = X_n[np.newaxis, :, :]
-    squared_diff_full = (X_n_expanded - predicted_expanded) ** 2
-    squared_diff = squared_diff_full.sum(axis=-1)
-
-    print("X_n shape:", X_n.shape)
-    print("X_n:\n", X_n)
-    print("u shape:", u.shape)
-    print("predicted_states shape:", predicted_states.shape)
-    print("predicted_states:\n", predicted_states)
-    print("predicted_expanded shape:", predicted_expanded.shape)
-    print("X_n_expanded shape:", X_n_expanded.shape)
-    print("squared_diff_full shape (m,m,2):", squared_diff_full.shape)
-    print("squared_diff shape (m,m):", squared_diff.shape)
-
-    # Use same numerical stabilization as implementation to avoid underflow/NaNs
-    var = pomdp.σ_w ** 2
-    min_per_row = np.min(squared_diff, axis=1, keepdims=True)
-    stabilized = np.exp(-(squared_diff - min_per_row) / (2 * var))
-    row_sums = stabilized.sum(axis=1, keepdims=True)
-    T_demo = np.divide(stabilized, row_sums, out=np.zeros_like(
-        stabilized), where=row_sums > 0)
-
-    print("Demonstration T (row-normalized):\n", T_demo)
-
-    return {
-        "X_n": X_n,
-        "predicted_states": predicted_states,
-        "predicted_expanded_shape": predicted_expanded.shape,
-        "X_n_expanded_shape": X_n_expanded.shape,
-        "squared_diff_shape": squared_diff.shape,
-        "T_demo": T_demo,
-    }
-
-
-def test_T_vectorized_entropy_vs_sigma(pomdp):
-    """Sweep σ_w and report average row entropy to show determinism vs spread."""
-    print("\n=== T_vectorized Row Entropy vs σ_w ===")
-    X_n = SquareLatticeQuantizer(0, 3, 0, 3, n=4).get_quantized_points()
-    u = np.array([0.4, 0.4])
-
-    def row_entropy(T):
-        eps = 1e-16
-        P = np.clip(T, eps, 1.0)
-        H_rows = -(P * np.log(P)).sum(axis=1)
-        return H_rows.mean()
-
-    sigmas = [0.005, 0.02, 0.05, 0.1, 0.2]
-    entropies = []
-    for s in sigmas:
-        # Temporarily set sigma and compute T
-        old = pomdp.σ_w
-        pomdp.σ_w = s
-        T = pomdp.T_vectorized(X_n, u)
-        pomdp.σ_w = old
-        ent = row_entropy(T)
-        entropies.append(ent)
-        print(f"σ_w={s:.3f} -> avg row entropy={ent:.6f}")
-
-    return sigmas, entropies
-
-
-def test_T_vectorized_outside_state_space(pomdp):
-    """Probe behavior when predicted state lies outside the convex hull of X_n."""
-    print("\n=== T_vectorized Outside State Space Behavior ===")
-    # Very small grid and large action to push outside
-    X_n = SquareLatticeQuantizer(0, 1, 0, 1, n=2).get_quantized_points()
-    u = np.array([5.0, 5.0])
-
-    old = pomdp.σ_w
-    pomdp.σ_w = 0.05
-    T = pomdp.T_vectorized(X_n, u)
-    pomdp.σ_w = old
-
-    print("X_n:\n", X_n)
-    print("T (rows sum to 1):\n", T)
-    print("row sums:", T.sum(axis=1))
-    # Ensure no NaNs and rows still normalize
-    assert not np.isnan(
-        T).any(), "T contains NaNs; stabilization/normalization failed"
-    assert np.allclose(
-        T.sum(axis=1), 1.0), "Rows should sum to 1 even outside state space"
-
-    return T
-
-
-def test_performance_compare_T_versions(pomdp):
-    """Benchmark T_vectorized (new) vs T_vectorized_v1 (old) across sizes."""
-    print("\n=== Performance: T_vectorized vs T_vectorized_v1 ===")
-    sizes = [4, 9, 16, 25, 36, 81, 16 * 16]
-    timings_new = []
-    timings_old = []
-
-    for n in sizes:
-        q = int(np.sqrt(n))
-        X_n = SquareLatticeQuantizer(0, q - 1, 0, q - 1, n=n).get_quantized_points()
-        u = np.array([0.4, -0.1])
-
-        t0 = time.time()
-        _ = pomdp.T_vectorized(X_n, u)
-        t1 = time.time()
-        _ = pomdp.T_vectorized_v1(X_n, u)
-        t2 = time.time()
-
-        timings_new.append(t1 - t0)
-        timings_old.append(t2 - t1)
-        print(
-            f"states={n:>3} | new={timings_new[-1]:.6f}s | old={timings_old[-1]:.6f}s | speedup={(timings_old[-1]/max(timings_new[-1],1e-12)):.2f}x")
-
-    # Plot if desired
+    # Create visualization
     plt.close('all')
-    plt.figure(figsize=(8, 5))
-    plt.plot(sizes, timings_new, 'g-o', label='T_vectorized (new)')
-    plt.plot(sizes, timings_old, 'r-o', label='T_vectorized_v1 (old)')
-    plt.xlabel('Number of states')
-    plt.ylabel('Time (s)')
-    plt.title('Transition kernel performance comparison')
-    plt.grid(True)
-    plt.legend()
-    out_path = 'output/T_performance_compare.png'
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    print('Saved performance comparison to:', out_path)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    return sizes, timings_new, timings_old
+    # Left plot: Transition probability heatmap
+    n_grid = int(np.sqrt(len(X_n)))
+    prob_grid = transition_probs.reshape(n_grid, n_grid)
+
+    im1 = ax1.imshow(prob_grid, cmap='viridis', origin='lower',
+                     extent=[X_n[:, 0].min(), X_n[:, 0].max(),
+                             X_n[:, 1].min(), X_n[:, 1].max()])
+    ax1.scatter([x_start[0]], [x_start[1]], c='red', s=100, marker='*',
+                label='Initial state', edgecolors='black', linewidth=2)
+    ax1.set_title('Transition Probabilities P(x_{t+1} | x_t, u)')
+    ax1.set_xlabel('X position')
+    ax1.set_ylabel('Y position')
+    ax1.legend()
+    plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    # Right plot: Predicted next state (mean)
+    predicted_mean = np.sum(X_n * transition_probs[:, np.newaxis], axis=0)
+    ax2.scatter(X_n[:, 0], X_n[:, 1], c=transition_probs, cmap='viridis',
+                s=50, alpha=0.7, edgecolors='black', linewidth=0.5)
+    ax2.scatter([x_start[0]], [x_start[1]], c='red', s=100, marker='*',
+                label='Initial state', edgecolors='black', linewidth=2)
+    ax2.scatter([predicted_mean[0]], [predicted_mean[1]], c='orange', s=100,
+                marker='x', label='Predicted mean', edgecolors='black', linewidth=2)
+
+    # Draw arrow from initial to predicted
+    ax2.arrow(x_start[0], x_start[1], predicted_mean[0] - x_start[0],
+              predicted_mean[1] - x_start[1], head_width=0.1, head_length=0.1,
+              fc='orange', ec='orange', alpha=0.8)
+
+    ax2.set_title('State Space with Transition Probabilities')
+    ax2.set_xlabel('X position')
+    ax2.set_ylabel('Y position')
+    ax2.legend()
+    ax2.set_aspect('equal', adjustable='box')
+
+    plt.tight_layout()
+    out_path = 'output/transition_probabilities.png'
+    plt.savefig(out_path, dpi=150)
+    print(f'Saved transition probability visualization to: {out_path}')
+
+    return transition_probs, predicted_mean
 
 
 # 3. Observation model
@@ -379,40 +211,40 @@ def test_ray_casting(pomdp):
 
     return ranges
 
-def test_vectorized_observation(pomdp):
-    """Test cartesian observation matrix calculation"""
-    print("\n=== Testing Cartesian Transition Matrix ===")
+def test_observation_model(pomdp):
+    """Test observation model Q(y | x, m) using current POMDP interface"""
+    print("\n=== Testing Observation Model Q(y | x, m) ===")
 
     # Create a small set of states for testing
     X_n = SquareLatticeQuantizer(0, 3, 0, 3, n=10).get_quantized_points()
-    n_y = 4
-    B = pomdp.sensor.B
-    Y = ObservationQuantizer(y_max=12, n=n_y, B=B).get_quantized_points()
-    print(f"Y shape: {Y.shape}")
-    assert Y.shape == (n_y**B, B), f"Y shape should be (n_y**B, B), but is {Y.shape}"
     m = pomdp.map.occupancy_map.data
 
-    print(f"Testing observation matrix for {len(X_n)} states")
+    # Create a more realistic test observation by taking an actual observation from one of the states
+    # This ensures we have a realistic observation that should have reasonable likelihoods
+    x_test = X_n[4]  # Use middle state
+    y_test = pomdp.ray_casting(x_test[np.newaxis, :], m)[0]  # Get real observation from this state
+
+    print(f"Testing observation model for {len(X_n)} states")
     print(f"States: {X_n}")
-    # print(f"Observations: {Y}")
+    print(f"Test observation (from state {x_test}): {y_test}")
 
     start_time = time.time()
-    Q_matrix = pomdp.Q_vectorized(Y, X_n, m)
+    Q_likelihoods = pomdp.Q(y_test, X_n, m)
     end_time = time.time()
 
-    print(f"Observation matrix calculation time: {end_time - start_time:.4f}s")
-    print(f"Observation matrix shape: {Q_matrix.shape}")
-    print(f"Observation matrix:\n{Q_matrix}")
+    print(f"Observation model calculation time: {end_time - start_time:.4f}s")
+    print(f"Likelihoods shape: {Q_likelihoods.shape}")
+    print(f"Likelihoods: {Q_likelihoods}")
 
     # Verify properties
-    row_sums = np.sum(Q_matrix, axis=1)
-    print(f"Row sums (should be close to 1): {row_sums}")
+    assert np.all(Q_likelihoods >= 0), "Likelihoods should be non-negative"
+    assert np.all(np.isfinite(Q_likelihoods)), "Likelihoods should be finite"
 
-    # Verify properties
-    col_sums = np.sum(Q_matrix, axis=0)
-    print(f"Column sums (should not be close to 1): {col_sums}")
+    # Check that likelihoods are reasonable (not all zero or all same)
+    assert np.any(Q_likelihoods > 0), "At least some likelihoods should be positive"
+    assert np.std(Q_likelihoods) > 1e-10, "Likelihoods should vary across states"
 
-    return Q_matrix
+    return Q_likelihoods
 
 def test_ogm_to_segments_conversion():
     """Validate converting an occupancy grid to obstacle segments.
@@ -421,17 +253,12 @@ def test_ogm_to_segments_conversion():
     assert that `_get_obstacles_from_map` returns the rectangle boundary
     segments with correct centroid and dimensions.
     """
-    # Create a minimal POMDP with map resolution = 1.0 for easy reasoning
-    from src.utils.map import load_obstacles_config
-    from src.classes.mapping import LidarGridMapVec
-    from src.classes.model import VelocityIntegratorModel, LIDAR
-    from src.classes.pomdp import POMDP
 
-    # Map spanning 0..4 in both axes -> 5x5 grid at resolution 1.0
-    map_vec = LidarGridMapVec(0, 4, 0, 4, resolution=1.0)
+    # Map spanning 0..4 in both axes -> 5x5 grid with quantization_level=5
+    map_vec = LidarGridMapVec(0, 4, 0, 4, quantization_level=5)
 
     # Dummy motion/sensor (not used here)
-    motion_model = VelocityIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
+    motion_model = SingleIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
     sensor = LIDAR(fov=360, r_max=10, B=36)
 
     pomdp = POMDP(motion_model=motion_model,
@@ -447,12 +274,12 @@ def test_ogm_to_segments_conversion():
     m[1:3, 1:4] = 1.0  # component: i in {1,2}, j in {1,2,3}
 
     # Run conversion
-    segments = pomdp._get_obstacles_from_map(m)
+    segments = pomdp.sensor.get_obstacles_from_map(m, pomdp.map)
 
-    # Expect a single rectangle with dx=3, dy=2, centroid at (2.5, 2.0)
-    dx = 3.0
-    dy = 2.0
-    centroid = np.array([2.5, 2.0])  # geometric center of occupied rectangle at cell edges
+    # Expect a single rectangle with dx=3, dy=2, centroid at (2, 2.4)
+    dx = 2.4
+    dy = 1.6
+    centroid = np.array([2, 2.4])  # geometric center of occupied rectangle at cell edges
 
     # Compute expected axis-aligned rectangle segments
     BL = (centroid[0] - dx / 2, centroid[1] - dy / 2)
@@ -482,14 +309,10 @@ def test_ogm_to_segments_conversion():
 
 
 def test_visualize_ogm_to_segments():
-    """Visualize the synthetic OGM and the recovered obstacle segments."""
+    """Visualize the synthetic OGM and the recovered obstacle segments in proper coordinate systems."""
     # Recreate the same synthetic setup as in test_ogm_to_segments_conversion
-    from src.classes.mapping import LidarGridMapVec
-    from src.classes.model import VelocityIntegratorModel, LIDAR
-    from src.classes.pomdp import POMDP
-
-    map_vec = LidarGridMapVec(0, 4, 0, 4, resolution=1.0)
-    motion_model = VelocityIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
+    map_vec = LidarGridMapVec(0, 4, 0, 4, quantization_level=5)
+    motion_model = SingleIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
     sensor = LIDAR(fov=360, r_max=10, B=36)
     pomdp = POMDP(motion_model=motion_model,
                   measurement_model=sensor,
@@ -498,32 +321,63 @@ def test_visualize_ogm_to_segments():
                   sigma_w=0.1,
                   sigma_v=0.1)
 
-    H, W = 5, 5
+    H, W = map_vec.occupancy_map.height, map_vec.occupancy_map.width
+    print(f"H: {H}, W: {W}")
     m = np.zeros((H, W), dtype=float)
-    m[1:3, 1:4] = 1.0
+    m[1:3, 1:4] = OCCUPIED
+    print(f"m: {m}")
+    segments = pomdp.sensor.get_obstacles_from_map(m, pomdp.map)
 
-    segments = pomdp._get_obstacles_from_map(m)
-
-    # Plot OGM and overlay segments
+    # Create a proper visualization with two subplots
     plt.close('all')
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.set_title('OGM with recovered obstacle segments')
-    ax.imshow(m, cmap='gray_r', origin='lower', extent=[0, 5, 0, 5], alpha=0.5)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Draw recovered rectangle segments (red)
+    # Left plot: OGM in grid coordinates (M space)
+    ax1.set_title('Occupancy Grid Map (M space)\nGrid coordinates')
+    ax1.imshow(m, cmap='gray_r', origin='lower', alpha=0.8)
+    ax1.set_xlabel('Grid column index')
+    ax1.set_ylabel('Grid row index')
+    ax1.set_xticks(range(W))
+    ax1.set_yticks(range(H))
+    ax1.grid(True, alpha=0.3)
+
+    # Highlight the occupied cells
+    occupied_cells = np.argwhere(m == OCCUPIED)
+    for cell in occupied_cells:
+        ax1.add_patch(plt.Rectangle((cell[1] - 0.5, cell[0] - 0.5), 1, 1,
+                                    fill=False, edgecolor='red', linewidth=2))
+
+    # Right plot: Obstacle segments in world coordinates (X space)
+    ax2.set_title('Recovered Obstacle Segments (X space)\nWorld coordinates')
+
+    # Draw the map boundaries
+    map_bounds = map_vec.occupancy_map
+    ax2.add_patch(plt.Rectangle((map_bounds.left_lower[0], map_bounds.left_lower[1]),
+                                map_bounds.right_upper[0] - map_bounds.left_lower[0],
+                                map_bounds.right_upper[1] - map_bounds.left_lower[1],
+                                fill=False, edgecolor='black', linewidth=1, linestyle='--'))
+
+    # Draw grid lines to show cell boundaries
+    resolution = map_bounds.resolution
+    for i in range(H + 1):
+        y = map_bounds.left_lower[1] + i * resolution
+        ax2.axhline(y=y, color='lightgray', linewidth=0.5, alpha=0.5)
+    for j in range(W + 1):
+        x = map_bounds.left_lower[0] + j * resolution
+        ax2.axvline(x=x, color='lightgray', linewidth=0.5, alpha=0.5)
+
+    # Draw recovered obstacle segments (red)
     for (x1, y1, x2, y2) in segments:
-        ax.plot([x1, x2], [y1, y2], 'r-', linewidth=2)
+        ax2.plot([x1, x2], [y1, y2], 'r-', linewidth=3,
+                 label='Obstacle segments' if (x1, y1, x2, y2) == segments[0] else "")
 
+    ax2.set_xlim([map_bounds.left_lower[0], map_bounds.right_upper[0]])
+    ax2.set_ylim([map_bounds.left_lower[1], map_bounds.right_upper[1]])
+    ax2.set_xlabel('World X coordinate (m)')
+    ax2.set_ylabel('World Y coordinate (m)')
+    ax2.set_aspect('equal', adjustable='box')
+    ax2.legend()
 
-    ax.set_xlim([0, 5])
-    ax.set_ylim([0, 5])
-    ax.set_aspect('equal', adjustable='box')
-    # Legend (proxy artists)
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-    occupied_proxy = Patch(facecolor='dimgray', edgecolor='none', alpha=0.5, label='Occupied cells (dark)')
-    segment_proxy = Line2D([0], [0], color='red', lw=2, label='Recovered segments')
-    ax.legend(handles=[occupied_proxy, segment_proxy], loc='upper right')
     plt.tight_layout()
     out_path = 'output/ogm_segments_validation.png'
     plt.savefig(out_path, dpi=150)
@@ -531,104 +385,106 @@ def test_visualize_ogm_to_segments():
     return out_path
 
 
-def test_Q_vectorized_indexing_validation(pomdp):
-    """Validate Q_vectorized vs loop baseline: rows=states i, cols=observations k."""
-    print("\n=== Validating Q_vectorized Indexing (rows: state i, cols: obs k) ===")
-    # Small set: 2 states, 3 observations
+def test_observation_model_validation(pomdp):
+    """Validate observation model Q(y | x, m) with manual computation."""
+    print("\n=== Validating Observation Model Q(y | x, m) ===")
+
+    # Small set: 2 states
     X_n = np.array([[0.0, 0.0], [1.0, 1.0]])
-    # Create fake observations by perturbing ideal rays
-    y_star = pomdp.ray_casting(X_n, pomdp.map.occupancy_map.data)  # (2,B)
-    # Pick 3 observations: exact y_star[0], exact y_star[1], and a mid average
-    Y = np.vstack([
-        y_star[0],
-        y_star[1],
-        0.5 * (y_star[0] + y_star[1])
-    ])  # (3,B)
+    m = pomdp.map.occupancy_map.data
 
-    Q_vec = pomdp.Q_vectorized(Y, X_n, pomdp.map.occupancy_map.data)  # (2,3)
+    # Create test observation
+    y_test = np.ones(pomdp.sensor.B) * pomdp.sensor.r_max / 2
 
-    # Loop baseline with stabilized weights
+    # Get POMDP Q values
+    Q_pomdp = pomdp.Q(y_test, X_n, m)
+
+    # Manual computation using ray_casting and multivariate normal
+    y_star = pomdp.ray_casting(X_n, m)  # (2, B)
     var = pomdp.σ_v ** 2
-    m = X_n.shape[0]
-    y_len = Y.shape[0]
-    Q_loop = np.zeros((m, y_len))
-    for i in range(m):
-        d2_row = np.array([np.sum((Y[k] - y_star[i])**2)
-                          for k in range(y_len)])
-        min_i = d2_row.min()
-        w = np.exp(-(d2_row - min_i) / (2 * var))
-        s = w.sum()
-        Q_loop[i, :] = w / s if s > 0 else 0.0
+    cov = np.eye(pomdp.sensor.B) * var
 
-    print("Q_vec:\n", Q_vec)
-    print("Q_loop baseline:\n", Q_loop)
-    assert np.allclose(Q_vec, Q_loop, atol=1e-10)
-    return Q_vec, Q_loop
+    Q_manual = np.zeros(len(X_n))
+    for i, y_star_i in enumerate(y_star):
+        # Manual multivariate normal PDF
+        diff = y_test - y_star_i
+        Q_manual[i] = np.exp(-0.5 * np.dot(diff, np.linalg.solve(cov, diff))) / \
+            np.sqrt((2 * np.pi)**pomdp.sensor.B * np.linalg.det(cov))
 
+    print("Q_pomdp:", Q_pomdp)
+    print("Q_manual:", Q_manual)
 
-def demonstrate_Q_vectorized_broadcasting(pomdp):
-    """Show shapes for Q_vectorized broadcasting and stabilized normalization."""
-    print("\n=== Demonstrating Q_vectorized Broadcasting Shapes ===")
-    X_n = SquareLatticeQuantizer(
-        0, 1, 0, 1, n=2).get_quantized_points()  # (4,2)
-    y_star = pomdp.ray_casting(X_n, pomdp.map.occupancy_map.data)
-    Y = np.vstack([
-        y_star[0],
-        y_star[1],
-        0.5 * (y_star[0] + y_star[1])
-    ])
+    # Should match closely
+    assert np.allclose(Q_pomdp, Q_manual, atol=1e-10, rtol=1e-5), \
+        f"POMDP Q and manual computation differ: {Q_pomdp} vs {Q_manual}"
 
-    y_star_expanded = y_star[:, np.newaxis, :]  # (m,1,B)
-    Y_expanded = Y[np.newaxis, :, :]  # (1,y_len,B)
-    diff = Y_expanded - y_star_expanded
-    squared_diff = np.sum(diff**2, axis=-1)
-
-    print("X_n shape:", X_n.shape)
-    print("y_star shape:", y_star.shape)
-    print("Y shape:", Y.shape)
-    print("y_star_expanded shape:", y_star_expanded.shape)
-    print("Y_expanded shape:", Y_expanded.shape)
-    print("diff shape:", diff.shape)
-    print("squared_diff shape:", squared_diff.shape)
-
-    var = pomdp.σ_v ** 2
-    min_per_row = np.min(squared_diff, axis=1, keepdims=True)
-    stabilized = np.exp(-(squared_diff - min_per_row) / (2 * var))
-    row_sums = stabilized.sum(axis=1, keepdims=True)
-    Q_demo = np.divide(stabilized, row_sums, out=np.zeros_like(
-        stabilized), where=row_sums > 0)
-    print("Q_demo (row-normalized):\n", Q_demo)
-    return Q_demo
+    return Q_pomdp, Q_manual
 
 
-def test_Q_entropy_vs_sigma(pomdp):
-    """Sweep σ_v and report avg row entropy of Q."""
-    print("\n=== Q_vectorized Row Entropy vs σ_v ===")
-    X_n = SquareLatticeQuantizer(0, 1, 0, 1, n=2).get_quantized_points()
-    y_star = pomdp.ray_casting(X_n, pomdp.map.occupancy_map.data)
-    Y = np.vstack([
-        y_star[0],
-        y_star[1],
-        0.5 * (y_star[0] + y_star[1])
-    ])
+def demonstrate_observation_model(pomdp):
+    """Demonstrate observation model behavior with different states and observations."""
+    print("\n=== Demonstrating Observation Model Behavior ===")
 
-    def row_entropy(T):
-        eps = 1e-16
-        P = np.clip(T, eps, 1.0)
-        H_rows = -(P * np.log(P)).sum(axis=1)
-        return H_rows.mean()
+    # Create a small grid of states
+    X_n = SquareLatticeQuantizer(0, 2, 0, 2, n=3).get_quantized_points()  # 9 states
+    m = pomdp.map.occupancy_map.data
 
-    sigmas = [0.01, 0.05, 0.1, 0.2]
-    entropies = []
+    print(f"Testing with {len(X_n)} states")
+    print(f"States: {X_n}")
+
+    # Test with different observation types
+    observations = {
+        'mid_range': np.ones(pomdp.sensor.B) * pomdp.sensor.r_max / 2,
+        'close_range': np.ones(pomdp.sensor.B) * pomdp.sensor.r_max / 4,
+        'max_range': np.ones(pomdp.sensor.B) * pomdp.sensor.r_max,
+    }
+
+    for obs_name, y_test in observations.items():
+        print(f"\n--- {obs_name} observation ---")
+        Q_likelihoods = pomdp.Q(y_test, X_n, m)
+        print(f"Likelihoods: {Q_likelihoods}")
+        print(f"Max likelihood state: {X_n[np.argmax(Q_likelihoods)]}")
+        print(f"Likelihood range: [{np.min(Q_likelihoods):.6f}, {np.max(Q_likelihoods):.6f}]")
+
+    return observations
+
+
+def test_observation_noise_sensitivity(pomdp):
+    """Test how observation model responds to different noise levels σ_v."""
+    print("\n=== Observation Model Noise Sensitivity ===")
+
+    X_n = SquareLatticeQuantizer(0, 2, 0, 2, n=3).get_quantized_points()
+    m = pomdp.map.occupancy_map.data
+
+    # Create a test observation
+    y_test = np.ones(pomdp.sensor.B) * pomdp.sensor.r_max / 2
+
+    sigmas = [0.01, 0.05, 0.1, 0.2, 0.5]
+    results = []
+
     for s in sigmas:
-        old = pomdp.σ_v
+        old_sigma = pomdp.σ_v
         pomdp.σ_v = s
-        Q = pomdp.Q_vectorized(Y, X_n, pomdp.map.occupancy_map.data)
-        pomdp.σ_v = old
-        ent = row_entropy(Q)
-        entropies.append(ent)
-        print(f"σ_v={s:.3f} -> avg row entropy={ent:.6f}")
-    return sigmas, entropies
+
+        Q_likelihoods = pomdp.Q(y_test, X_n, m)
+
+        # Compute entropy-like measure (higher = more spread)
+        entropy = -np.sum(Q_likelihoods * np.log(Q_likelihoods + 1e-16))
+        max_likelihood = np.max(Q_likelihoods)
+        likelihood_std = np.std(Q_likelihoods)
+
+        results.append({
+            'sigma': s,
+            'entropy': entropy,
+            'max_likelihood': max_likelihood,
+            'likelihood_std': likelihood_std
+        })
+
+        print(f"σ_v={s:.3f} -> entropy={entropy:.4f}, max_lik={max_likelihood:.6f}, std={likelihood_std:.6f}")
+
+        pomdp.σ_v = old_sigma
+
+    return results
 
 
 # 4. Cost functions
@@ -663,13 +519,9 @@ def test_c_vff_manual_validation():
       - Position x near the occupied cell; compute F_r analytically from definition
       - Choose u to test movement towards and away from obstacle; compare with c_vff
     """
-    from src.classes.mapping import LidarGridMapVec
-    from src.classes.model import VelocityIntegratorModel, LIDAR
-    from src.classes.pomdp import POMDP
-
     # Tiny map
-    map_vec = LidarGridMapVec(0, 4, 0, 4, resolution=1.0)
-    motion_model = VelocityIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
+    map_vec = LidarGridMapVec(0, 4, 0, 4, quantization_level=4)
+    motion_model = SingleIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
     sensor = LIDAR(fov=360, r_max=10, B=36)
     pomdp = POMDP(motion_model=motion_model,
                   measurement_model=sensor,
@@ -733,13 +585,11 @@ def test_c_vff_manual_validation():
 # 5. Map gen
 def test_generate_space_of_maps_3x3():
     """Generate map IDs for a 3x3 grid and verify count + conversion."""
-    from src.classes.mapping import LidarGridMapVec
-    from src.classes.model import VelocityIntegratorModel, LIDAR
-    from src.classes.pomdp import POMDP
 
     # Build a 3x3 grid: x,y in [0,2] with resolution 1.0 -> width=3, height=3
-    map_vec = LidarGridMapVec(0, 2, 0, 2, resolution=1.0)
-    motion_model = VelocityIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
+
+    map_vec = LidarGridMapVec(0, 2, 0, 2, quantization_level=3)
+    motion_model = SingleIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
     sensor = LIDAR(fov=360, r_max=10, B=36)
     pomdp = POMDP(motion_model=motion_model,
                   measurement_model=sensor,
@@ -782,13 +632,10 @@ def test_generate_space_of_maps_3x3():
 
 def test_generate_space_of_maps_4x4():
     """Generate map IDs for a 4x4 grid and verify count, memory, and conversions."""
-    from src.classes.mapping import LidarGridMapVec
-    from src.classes.model import VelocityIntegratorModel, LIDAR
-    from src.classes.pomdp import POMDP
 
     # 4x4 grid: x,y in [0,3] with resolution 1.0 -> width=4, height=4
-    map_vec = LidarGridMapVec(0, 3, 0, 3, resolution=1.0)
-    motion_model = VelocityIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
+    map_vec = LidarGridMapVec(0, 3, 0, 3, quantization_level=4)
+    motion_model = SingleIntegratorModel(i_x=0.0, i_y=0.0, dt=0.1, max_v=1.0)
     sensor = LIDAR(fov=360, r_max=10, B=36)
     pomdp = POMDP(motion_model=motion_model,
                   measurement_model=sensor,
@@ -825,9 +672,85 @@ def test_generate_space_of_maps_4x4():
         print(f"Re-encoded ID: {b2}")
         assert int(b) == int(b2)
 
-# 6. Performance analysis
+# 6. New Visualizations
+def test_visualize_observation_likelihood(pomdp):
+    """Visualize observation likelihood Q(y | x, m) for various states."""
+    print("\n=== Visualizing Observation Likelihood ===")
+
+    # Create a quantized state space
+    from src.classes.quantizer import SquareLatticeQuantizer
+    X_n = SquareLatticeQuantizer(0, 5, 0, 5, n=11).get_quantized_points()  # 11x11 = 121 states
+
+    # Pick a true state and generate observation from it
+    x_true = np.array([2.5, 2.5])
+    x_true_idx = np.argmin(np.linalg.norm(X_n - x_true, axis=1))
+    x_true_actual = X_n[x_true_idx]
+
+    # Get true observation from this state
+    m = pomdp.map.occupancy_map.data
+    y_true = pomdp.ray_casting(x_true_actual[np.newaxis, :], m)[0]
+
+    print(f"True state: {x_true_actual}")
+    print(f"True observation: {y_true[:5]}... (showing first 5 beams)")
+
+    # Compute likelihood Q(y_true | x, m) for all states
+    likelihoods = pomdp.Q(y_true, X_n, m)
+
+    # Create visualization
+    plt.close('all')
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Left plot: Likelihood heatmap
+    n_grid = int(np.sqrt(len(X_n)))
+    likelihood_grid = likelihoods.reshape(n_grid, n_grid)
+
+    im1 = ax1.imshow(likelihood_grid, cmap='plasma', origin='lower',
+                     extent=[X_n[:, 0].min(), X_n[:, 0].max(),
+                             X_n[:, 1].min(), X_n[:, 1].max()])
+    ax1.scatter([x_true_actual[0]], [x_true_actual[1]], c='red', s=100, marker='*',
+                label='True state', edgecolors='black', linewidth=2)
+    ax1.set_title('Observation Likelihood Q(y | x, m)')
+    ax1.set_xlabel('X position')
+    ax1.set_ylabel('Y position')
+    ax1.legend()
+    plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    # Right plot: Likelihood as scatter plot
+    scatter = ax2.scatter(X_n[:, 0], X_n[:, 1], c=likelihoods, cmap='plasma',
+                          s=50, alpha=0.8, edgecolors='black', linewidth=0.5)
+    ax2.scatter([x_true_actual[0]], [x_true_actual[1]], c='red', s=100, marker='*',
+                label='True state', edgecolors='black', linewidth=2)
+
+    # Highlight states with high likelihood
+    high_likelihood_mask = likelihoods > np.percentile(likelihoods, 90)
+    if np.any(high_likelihood_mask):
+        ax2.scatter(X_n[high_likelihood_mask, 0], X_n[high_likelihood_mask, 1],
+                    c='yellow', s=80, marker='s', alpha=0.6,
+                    label='Top 10% likelihood', edgecolors='black', linewidth=1)
+
+    ax2.set_title('State Space with Observation Likelihoods')
+    ax2.set_xlabel('X position')
+    ax2.set_ylabel('Y position')
+    ax2.legend()
+    ax2.set_aspect('equal', adjustable='box')
+
+    plt.tight_layout()
+    out_path = 'output/observation_likelihood.png'
+    plt.savefig(out_path, dpi=150)
+    print(f'Saved observation likelihood visualization to: {out_path}')
+
+    # Print statistics
+    max_likelihood_idx = np.argmax(likelihoods)
+    max_likelihood_state = X_n[max_likelihood_idx]
+    print(f"Maximum likelihood state: {max_likelihood_state}")
+    print(f"Maximum likelihood value: {likelihoods[max_likelihood_idx]:.6f}")
+    print(f"True state likelihood: {likelihoods[x_true_idx]:.6f}")
+
+    return likelihoods, max_likelihood_state
+
+# 7. Performance analysis
 def test_performance_analysis(pomdp):
-    """Analyze performance bottlenecks"""
+    """Analyze performance bottlenecks using current T method"""
     print("\n=== Performance Analysis ===")
 
     # Test with different state set sizes
@@ -843,8 +766,11 @@ def test_performance_analysis(pomdp):
 
         u = np.array([0.5, 0.3])
 
+        # Test transition probability calculation for a single Borel set
+        B = np.array([[0.0, 5.0], [0.0, 5.0]])  # Full state space
+
         start_time = time.time()
-        T_matrix = pomdp.T_vectorized(X_n, u)
+        T_probs = pomdp.T(B, X_n, u)
         end_time = time.time()
 
         elapsed = end_time - start_time
@@ -858,7 +784,7 @@ def test_performance_analysis(pomdp):
     plt.plot(state_sizes, times, 'bo-')
     plt.xlabel('Number of States')
     plt.ylabel('Time (s)')
-    plt.title('Transition Matrix Calculation Time')
+    plt.title('Transition Probability Calculation Time')
     plt.grid(True)
 
     plt.subplot(1, 2, 2)
@@ -888,7 +814,7 @@ def test_visualize_single_pose_lidar(pomdp):
 
     # Prepare a background grid for plotting
     all_obstacles, area = load_obstacles_config(environment='toy2')
-    gridmap = LidarGridMap(*area, resolution=pomdp.map.xy_resolution)
+    gridmap = LidarGridMap(*area, resolution=pomdp.map.occupancy_map.resolution)
 
     # Adapter so plot_step can call get_float_data on cells
     class _Cell:
@@ -918,12 +844,9 @@ def test_visualize_single_pose_lidar(pomdp):
     cy = 0.5 * (area[2] + area[3])
     robot_pose = np.array([cx, cy, 0.0])
 
-    # Build obstacle segments from current occupancy grid via POMDP helpers
+    # Build obstacle segments from current occupancy grid via sensor helpers
     m = pomdp.map.occupancy_map.data
-    components = pomdp._find_connected_components(m)
-    segments = []
-    for comp in components:
-        segments.extend(pomdp._create_obstacle_from_component(comp))
+    segments = pomdp.sensor.get_obstacles_from_map(m, pomdp.map)
 
     # Get lidar reflections for this single pose
     dist_theta = pomdp.sensor.get_laser_ref(
@@ -1045,7 +968,7 @@ def test_visualize_ogm_and_raycasting_hits_3x3(pomdp):
     ax.imshow(grid_data, cmap='gray_r', origin='upper',
               extent=[area[0], area[1], area[2], area[3]], alpha=0.8)
     # Overlay obstacle boundaries derived from the OGM used in ray_casting
-    ogm_segments = pomdp._get_obstacles_from_map(grid_data)
+    ogm_segments = pomdp.sensor.get_obstacles_from_map(grid_data, pomdp.map)
     ogm_points = connect_segments(np.array(ogm_segments), resolution=0.05)
     ax.scatter(ogm_points[:, 0], ogm_points[:, 1],
                marker='.', c='y', edgecolor='none', alpha=0.35, s=4)
@@ -1130,7 +1053,7 @@ def test_visualize_ogm_and_raycasting_hits_4x4(pomdp):
     ax.imshow(grid_data, cmap='gray_r', origin='upper',
               extent=[area[0], area[1], area[2], area[3]], alpha=0.8)
     # Overlay obstacle boundaries derived from the OGM used in ray_casting
-    ogm_segments = pomdp._get_obstacles_from_map(grid_data)
+    ogm_segments = pomdp.sensor.get_obstacles_from_map(grid_data, pomdp.map)
     ogm_points = connect_segments(np.array(ogm_segments), resolution=0.05)
     ax.scatter(ogm_points[:, 0], ogm_points[:, 1],
                marker='.', c='y', edgecolor='none', alpha=0.35, s=4)
@@ -1174,44 +1097,49 @@ def main():
     print("Starting POMDP Test Suite")
     print("=" * 50)
 
-    # 1. Test initialization
-    pomdp = test_pomdp_initialization_3x3()
+    # # 1. Test initialization
+    print("\n=== 1. POMDP Initialization ===")
+    pomdp3x3 = test_pomdp_initialization_3x3()
+    pomdp4x4 = test_pomdp_initialization_4x4()
 
-    # 2. Test transition matrix functionality
-    # test_vectorized_transition(pomdp)
-    # test_T_vectorized_indexing_validation(pomdp)
-    # demonstrate_T_vectorized_broadcasting(pomdp)
-    # test_T_vectorized_entropy_vs_sigma(pomdp)
-    # test_T_vectorized_outside_state_space(pomdp)
+    # 2. Observation model tests
+    print("\n=== 2. Observation Model Tests ===")
+    test_ray_casting(pomdp3x3)
+    test_observation_model(pomdp3x3)
+    test_observation_model_validation(pomdp3x3)
+    demonstrate_observation_model(pomdp3x3)
+    test_observation_noise_sensitivity(pomdp3x3)
 
-    # 2b. Compare new vs old T implementations
-    # test_compare_T_vectorized_versions(pomdp)
-    # test_performance_compare_T_versions(pomdp)
+    # 3. OGM conversion tests
+    print("\n=== 3. OGM Conversion Tests ===")
+    test_ogm_to_segments_conversion()
+    test_visualize_ogm_to_segments()
 
-    # 3. Observation model
-    # test_ray_casting(pomdp)
-    # test_vectorized_observation(pomdp)
-    # test_ogm_to_segments_conversion()
-    # test_visualize_ogm_to_segments()
-    # test_Q_vectorized_indexing_validation(pomdp)
-    # demonstrate_Q_vectorized_broadcasting(pomdp)
-    # test_Q_entropy_vs_sigma(pomdp)
+    # 4. Cost function tests
+    print("\n=== 4. Cost Function Tests ===")
+    test_cost_functions(pomdp3x3)
+    test_c_vff_manual_validation()
 
-    # 4. Cost functions
-    # test_cost_functions(pomdp)
-    # test_c_vff_manual_validation()
+    # 5. Map generation tests
+    print("\n=== 5. Map Generation Tests ===")
+    test_generate_space_of_maps_3x3()
+    test_generate_space_of_maps_4x4()
 
-    # 5. Map generation
-    # test_generate_space_of_maps_3x3()
-    # test_generate_space_of_maps_4x4()
+    # # 6. Visualization tests
+    print("\n=== 6. Visualization Tests ===")
+    test_visualize_single_pose_lidar(pomdp3x3)
+    test_visualize_arena_and_hits(pomdp3x3)
+    test_visualize_ogm_and_raycasting_hits_3x3(pomdp3x3)
+    test_visualize_ogm_and_raycasting_hits_4x4(pomdp4x4)
 
-    # 6. Visualization snapshot
-    # test_visualize_single_pose_lidar(pomdp)
-    # test_visualize_arena_and_hits(pomdp)
-    # test_visualize_ogm_and_raycasting_hits_4x4(pomdp)
+    # 7. New transition and observation visualizations
+    print("\n=== 7. New Transition and Observation Visualizations ===")
+    test_visualize_transition_probabilities(pomdp3x3)
+    test_visualize_observation_likelihood(pomdp3x3)
 
-    # # Performance analysis
-    # test_performance_analysis(pomdp)
+    # 8. Performance analysis
+    print("\n=== 8. Performance Analysis ===")
+    test_performance_analysis(pomdp3x3)
 
     print("\n" + "=" * 50)
     print("POMDP Test Suite Complete!")

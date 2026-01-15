@@ -1,5 +1,5 @@
 import itertools
-import numpy as np
+from ..utils.array_backend import np
 
 
 def cartesian(*arrays):
@@ -31,7 +31,7 @@ def cartesian_transpose_pp(arrays):
     arr = np.empty((la, *map(len, arrays)), dtype=dtype)
     idx = slice(None), *itertools.repeat(None, la)
     for i, a in enumerate(arrays):
-        arr[i, ...] = a[idx[:la-i]]
+        arr[i, ...] = a[idx[:la - i]]
     return arr.reshape(la, -1).T
 
 

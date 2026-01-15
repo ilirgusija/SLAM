@@ -1,7 +1,7 @@
 from ..utils.map import load_obstacles_config
 from ..classes.mapping import LidarGridMapVec, GridMapNP, OCCUPIED
-from ..classes.model import VelocityIntegratorModel, LIDAR
-import numpy as np
+from ..classes.model import SingleIntegratorModel, LIDAR
+from ..utils.array_backend import np
 
 
 class QLearning:
@@ -13,7 +13,7 @@ class QLearning:
         self.x_history = [x_0]
         self.u_history = []
         # Initialize true map from config accounting for resolution
-        self.model = VelocityIntegratorModel(x_0[0], x_0[1], 0.1, 3)
+        self.model = SingleIntegratorModel(x_0[0], x_0[1], 0.1, 3)
         self.sensor = LIDAR(fov=360, max_range=12, n_reflections=360)
         self.gridmap = LidarGridMapVec(*area, resolution=resolution)
         all_obstacles, area = load_obstacles_config(environment=env)
@@ -32,10 +32,10 @@ class QLearning:
             cx, cy = obs.centroid
             # Four corners (clockwise)
             corners = np.array([
-                [cx + 0.5*(dx_cos + dy_sin), cy + 0.5*(dx_sin - dy_cos)],  # BR
-                [cx + 0.5*(dx_cos - dy_sin), cy + 0.5*(dx_sin + dy_cos)],  # TR
-                [cx - 0.5*(dx_cos - dy_sin), cy - 0.5*(dx_sin + dy_cos)],  # BL
-                [cx - 0.5*(dx_cos + dy_sin), cy - 0.5*(dx_sin - dy_cos)],  # TL
+                [cx + 0.5 * (dx_cos + dy_sin), cy + 0.5 * (dx_sin - dy_cos)],  # BR
+                [cx + 0.5 * (dx_cos - dy_sin), cy + 0.5 * (dx_sin + dy_cos)],  # TR
+                [cx - 0.5 * (dx_cos - dy_sin), cy - 0.5 * (dx_sin + dy_cos)],  # BL
+                [cx - 0.5 * (dx_cos + dy_sin), cy - 0.5 * (dx_sin - dy_cos)],  # TL
             ])
             # Fill grid cells inside the polygon
             # (Adapted from GridMap.set_value_from_polygon)
@@ -72,7 +72,7 @@ class QLearning:
         return true_map
 
     def alpha_t(self, t, x, u):
-        return 1/(1+np.sum((self.x_history[:t] == x) & (self.u_history[:t] == u)))
+        return 1 / (1 + np.sum((self.x_history[:t] == x) & (self.u_history[:t] == u)))
 
     def select_action(self, state):
         return np.random.choice(self.action_space)
@@ -120,11 +120,11 @@ class QLearning:
         x_pos, y_pos = x[0], x[1]
         x_ind, y_ind = self.gridmap.occupancy_map.get_xy_index_from_xy_pos(
             np.array([x_pos, y_pos]))
-        window = grid[x_ind-16:x_ind+16, y_ind-16:y_ind+16]
+        window = grid[x_ind - 16:x_ind + 16, y_ind - 16:y_ind + 16]
         F_cr = 10.0  # constant
         indices = np.indices(window.shape)
         d_ij = np.sqrt(indices[0]**2 + indices[1]**2)
-        F_ij = (F_cr * window / (d_ij**2)) * (1/d_ij *
+        F_ij = (F_cr * window / (d_ij**2)) * (1 / d_ij *
                                               np.linalg.norm(indices - [x_ind, y_ind], axis=0))
         F_r = np.sum(F_ij)
         cost_obs = np.max(0, np.dot(F_r, u) /

@@ -1,6 +1,8 @@
 import yaml
-import numpy as np
+import numpy as _numpy  # For masked arrays only (CuPy doesn't support ma)
 import numpy.ma as ma
+from pathlib import Path
+from ..utils.array_backend import np  # Use backend for regular operations
 from ..classes.obstacle import Obstacle
 
 
@@ -9,7 +11,11 @@ def load_obstacles_config(environment):
     :param environment: name of the yaml config file
     :return: all obstacles, area of the environment
     """
-    with open('src/config/'+environment+'.yaml') as file:
+    # Get the path relative to this file's location
+    config_dir = Path(__file__).parent.parent / 'config'
+    config_path = config_dir / f'{environment}.yaml'
+
+    with open(config_path) as file:
         yaml_data = yaml.load(file, Loader=yaml.FullLoader)
 
         # load environment area parameters
@@ -21,7 +27,7 @@ def load_obstacles_config(environment):
         all_obstacles = []
         for i in range(len(obs)):
             obs_i = Obstacle(centroid=[obs[i]['centroid_x'], obs[i]['centroid_y']], dx=obs[i]['dx'], dy=obs[i]['dy'],
-                             angle=obs[i]['orientation']*np.pi/180, vel=[obs[i]['velocity_x'], obs[i]['velocity_y']],
+                             angle=obs[i]['orientation'] * np.pi / 180, vel=[obs[i]['velocity_x'], obs[i]['velocity_y']],
                              acc=[obs[i]['acc_x'], obs[i]['acc_y']])
             all_obstacles.append(obs_i)
     return all_obstacles, area
