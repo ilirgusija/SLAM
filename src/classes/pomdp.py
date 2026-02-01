@@ -1,10 +1,11 @@
 # Use CuPy backend for GPU acceleration (falls back to NumPy if not available)
 # Note: T matrix computation stays on CPU (sunk cost), GPU acceleration focused on H, F, η_n
-from ..utils.array_backend import np
-from .model import SingleIntegratorModel, DoubleIntegratorModel, LIDAR
+from ..utils.array_backend import np, is_cupy
+from .model import SingleIntegratorModel, DoubleIntegratorModel, LIDAR, RangeBearingSensor
 from .obstacle import Obstacle
-from .mapping import LidarGridMapVec
+from .mapping import BaseMap, LidarGridMapVec, OrderedLandmarkMap
 from scipy.stats import multivariate_normal as mvn
+from scipy.stats import norm as univariate_norm
 import numpy as numpy_cpu
 # Optional tqdm import for progress bars
 try:
@@ -46,9 +47,9 @@ class BasePOMDP:
 
     def __init__(self,
                  motion_model: SingleIntegratorModel | DoubleIntegratorModel,
-                 measurement_model: LIDAR,
+                 measurement_model,  # LIDAR or RangeBearingSensor
                  obstacles: list[Obstacle],
-                 _map: LidarGridMapVec,
+                 _map: BaseMap,
                  sigma_w: float = 0.01,
                  sigma_v: float = 0.01,
                  force_constant: float = 100
@@ -58,20 +59,61 @@ class BasePOMDP:
         self.obstacles = obstacles
         self.map = _map
 
+        # Determine sensor type and observation space dimension
+        self._is_lidar = isinstance(measurement_model, LIDAR)
+        self._is_range_bearing = isinstance(measurement_model, RangeBearingSensor)
+
+        if self._is_lidar:
+            # LIDAR: observation space dimension is B (number of beams)
+            obs_dim = measurement_model.B
+        else:
+            # RangeBearingSensor: observation dimension depends on map at use time
+            # cov_y is not set here since it is not used with this sensor
+            obs_dim = None
+
         if isinstance(motion_model, SingleIntegratorModel):
             self.σ_w = sigma_w * np.sqrt(motion_model.dt)
             self.σ_v = sigma_v
             self.cov_x = np.eye(2) * sigma_w * sigma_w * motion_model.dt
-            self.cov_y = np.eye(measurement_model.B) * sigma_v * sigma_v
+            # Only set cov_y if using LIDAR (fixed dimension)
+            self.cov_y = np.eye(obs_dim) * sigma_v * sigma_v if self._is_lidar else None
         elif isinstance(motion_model, DoubleIntegratorModel):
             self.σ_w = sigma_w
             self.σ_v = sigma_v
             self.cov_x = motion_model.Q_t * sigma_w
-            self.cov_y = np.eye(measurement_model.B) * sigma_v * sigma_v
+            # Only set cov_y if using LIDAR (fixed dimension)
+            self.cov_y = np.eye(obs_dim) * sigma_v * sigma_v if self._is_lidar else None
 
         self._map_cache = {}
         self._integration_cache = {}
         self.force_constant = force_constant
+
+    def get_observation_dimension(self, map_representation=None):
+        """
+        Get observation space dimension for the current sensor and map.
+
+        Args:
+            map_representation: Optional map representation (for RangeBearingSensor with LandmarkMap)
+
+        Returns:
+            int: Observation space dimension
+        """
+        if self._is_lidar:
+            return self.sensor.B
+        elif self._is_range_bearing:
+            from .mapping import LandmarkMap
+            if isinstance(self.map, LandmarkMap):
+                if map_representation is not None:
+                    # Return dimension based on number of candidate landmarks
+                    # Each landmark has 2 observations (range, bearing)
+                    return 2 * self.map.num_candidate_landmarks
+                else:
+                    # Default: return dimension for all candidate landmarks
+                    return 2 * self.map.num_candidate_landmarks
+            else:
+                raise ValueError("RangeBearingSensor requires LandmarkMap")
+        else:
+            raise ValueError(f"Unsupported sensor type: {type(self.sensor)}")
 
     @staticmethod
     def c_effort(u):
@@ -124,12 +166,22 @@ class Localization_POMDP(BasePOMDP):
         if state_dim != B_dim:
             raise ValueError(f"State dimension {state_dim} does not match Borel set dimension {B_dim}")
 
-        X_cpu = numpy_cpu.asarray(X)
-        B_cpu = numpy_cpu.asarray(B)
-        u_cpu = numpy_cpu.asarray(u)
-        cov_cpu = numpy_cpu.asarray(self.cov_x)
+        X_cpu = X.get() if hasattr(X, 'get') else numpy_cpu.asarray(X)
+        B_cpu = B.get() if hasattr(B, 'get') else numpy_cpu.asarray(B)
+        u_cpu = u.get() if hasattr(u, 'get') else numpy_cpu.asarray(u)
+        cov_x_raw = self.cov_x
+        cov_cpu = cov_x_raw.get() if hasattr(cov_x_raw, 'get') else numpy_cpu.asarray(cov_x_raw)
 
-        mu = numpy_cpu.asarray(self.motion_model.f_bar(X_cpu, u_cpu))
+        # f_bar uses backend np (could be CuPy), so convert inputs to backend arrays
+        # then convert result back to NumPy for mvn.cdf
+        if is_cupy:
+            X_backend = np.asarray(X_cpu)
+            u_backend = np.asarray(u_cpu)
+            mu_raw = self.motion_model.f_bar(X_backend, u_backend)
+            mu = mu_raw.get() if hasattr(mu_raw, 'get') else numpy_cpu.asarray(mu_raw)
+        else:
+            mu_raw = self.motion_model.f_bar(X_cpu, u_cpu)
+            mu = mu_raw.get() if hasattr(mu_raw, 'get') else numpy_cpu.asarray(mu_raw)
         mins = B_cpu[:, 0]
         maxs = B_cpu[:, 1]
 
@@ -141,20 +193,13 @@ class Localization_POMDP(BasePOMDP):
 
     ###########################################################
     ### 2. Cost Functions #####################################
-    def c(self, x, u):
-        """
-        Cost function for localization: focuses on pose estimation accuracy and collision avoidance.
-        Map is known, so cost depends only on pose x and action u.
-        """
-        return self.c_effort(u) + self.c_collision(x, u)
-
     def c_collision(self, x, u, ε=1e-6):
         """
         Cost function for collision avoidance in localization.
         """
         pass
 
-    def c_vectorized_batch(self, X_batch: np.ndarray, U_batch: np.ndarray) -> np.ndarray:
+    def c(self, X_batch: np.ndarray, U_batch: np.ndarray) -> np.ndarray:
         """
         Batched cost computation: c(x, u) for all (x, u) pairs.
 
@@ -174,20 +219,51 @@ class Localization_POMDP(BasePOMDP):
         return effort + collision
 
     ##########################################################
-    ### 3. Ray Casting #######################################
+    ### 4. Ray Casting #######################################
     def ray_casting(self, X):
         """
         Ray casting for localization - uses pre-computed obstacle segments from known map.
 
+        Supports both LIDAR and RangeBearingSensor. For RangeBearingSensor, just calls sensor.g_bar().
+
         Args:
-            X: Array of robot positions (m_n, 2)
+            X: Array of robot states
+               - For LIDAR: (m_n, 2) positions
+               - For RangeBearingSensor: (m_n, state_dim) where state_dim can be 2, 3, or 4
 
         Returns:
-            y_star: Array of distances (m_n, B)
+            y_star: Array of observations
+               - For LIDAR: (m_n, B) distances
+               - For RangeBearingSensor: (m_n, num_landmarks, 2) [range, bearing]
         """
-        if self.known_map_obstacle_segments is None:
-            raise ValueError("Known map obstacle segments not set. Call set_known_map() first.")
-        return self.sensor.g_bar_localization(X, self.known_map_obstacle_segments)
+        if self._is_lidar:
+            if self.known_map_obstacle_segments is None:
+                raise ValueError("Known map obstacle segments not set. Call set_known_map() first.")
+            return self.sensor.g_bar_localization(X, self.known_map_obstacle_segments)
+        elif self._is_range_bearing:
+            # For RangeBearingSensor, just call g_bar directly with landmark positions
+            # Sensor handles state dimension internally (2D/3D/4D -> appropriate bearing computation)
+            from .mapping import LandmarkMap
+
+            # Get landmark positions
+            if isinstance(self.map, LandmarkMap) and hasattr(self, 'known_map_representation'):
+                landmark_positions = self.map.get_landmark_positions(self.known_map_representation)
+            elif self.known_map_obstacle_segments is not None:
+                # Fallback: convert obstacle segments to landmark positions (centroids)
+                landmark_positions = []
+                for seg in self.known_map_obstacle_segments:
+                    if isinstance(seg, tuple) and len(seg) == 4:
+                        x1, y1, x2, y2 = seg
+                        landmark_positions.append([(x1 + x2) / 2, (y1 + y2) / 2])
+                landmark_positions = np.array(landmark_positions) if landmark_positions else np.empty((0, 2))
+            else:
+                raise ValueError(
+                    "For RangeBearingSensor, either set known_map_representation or known_map_obstacle_segments")
+
+            # Call sensor.g_bar directly - it handles state dimension and bearing computation
+            return self.sensor.g_bar(X, landmark_positions)
+        else:
+            raise ValueError(f"Unsupported sensor type: {type(self.sensor)}")
 
     def set_known_map(self, obstacle_segments):
         """
@@ -214,29 +290,6 @@ class Localization_POMDP(BasePOMDP):
             # Assume it's already a list of segments
             self.known_map_obstacle_segments = obstacle_segments
 
-    def Q_vectorized_batch(self, Y_batch: np.ndarray, X: np.ndarray) -> np.ndarray:
-        """
-        Batched Q computation: Q(y | x) for all (y, x) pairs using known map.
-
-        Args:
-            Y_batch: observations (n_obs, B)
-            X: states (m_n, state_dim)
-        Returns:
-            Q_batch: (n_obs, m_n) where Q_batch[k, i] = Q(Y_batch[k] | X[i])
-        """
-        if self.known_map_obstacle_segments is None:
-            raise ValueError("Known map obstacle segments not set. Call set_known_map() first.")
-
-        X_pos = X[:, :2] if X.shape[1] > 2 else X
-        y_star = self.ray_casting(X_pos)
-
-        y_diff = Y_batch[:, np.newaxis, :] - y_star[np.newaxis, :, :]
-        log_const = -0.5 * self.sensor.B * np.log(2 * np.pi) - self.sensor.B * np.log(self.σ_v)
-        squared_diff = np.sum(y_diff ** 2, axis=2)
-        log_Q = log_const - 0.5 * squared_diff / (np.square(self.σ_v))
-
-        return np.exp(log_Q)
-
 
 class Mapping_POMDP(BasePOMDP):
     """
@@ -256,73 +309,8 @@ class Mapping_POMDP(BasePOMDP):
 
     ###########################################################
     ### 1. Cost Functions #####################################
-    def c(self, m, u):
-        """
-        Cost function for mapping: focuses on map exploration and information gain.
-        Pose is known, so cost depends only on map m and action u.
-        """
-        return self.c_effort(u) + self.c_vff(self.known_pose, m, u)
 
-    def F_r(self, x, m):
-        """Repulsive force from obstacles using occupancy grid map."""
-        x_pos = x[:2] if len(x) > 2 else x
-        m_pos = self.map.occupancy_map.get_occupied_map_positions(m)
-
-        diff = m_pos - x_pos
-        d = np.linalg.norm(diff, axis=1)
-        within = d <= 10.0
-
-        if not np.any(within):
-            return np.zeros(2, dtype=np.float32)
-
-        diff = diff[within]
-        d = d[within]
-        inv_d3 = 1.0 / np.maximum(d, 1e-6)**3
-        forces = (self.force_constant * diff) * inv_d3[:, None]
-
-        return forces.sum(axis=0)
-
-    def c_vff(self, x, m, u, ε=1e-6):
-        """Collision avoidance cost for mapping."""
-        F_r = self.F_r(x, m)
-        dot = np.dot(F_r, u)
-        norms = np.linalg.norm(F_r) * np.linalg.norm(u) + ε
-        return np.maximum(0, dot / norms)
-
-    def F_r_vectorized_batch(self, X_batch: np.ndarray, M_batch: np.ndarray) -> np.ndarray:
-        """
-        Batched repulsive force computation: F_r(x, m) for all (x, m) pairs.
-
-        Args:
-            X_batch: positions (n_x, 2) or (2,)
-            M_batch: maps (n_m, H, W) or (H, W)
-        Returns:
-            F_r_batch: (n_x, n_m, 2) where F_r_batch[i, j] = F_r(X_batch[i], M_batch[j])
-        """
-        if X_batch.ndim == 1:
-            X_batch = X_batch[np.newaxis, :]
-        if M_batch.ndim == 2:
-            M_batch = M_batch[np.newaxis, :, :]
-
-        n_x, n_m = X_batch.shape[0], M_batch.shape[0]
-        m_positions, valid_mask = self.map.occupancy_map.get_occupied_map_positions_batched(M_batch)
-
-        if m_positions.shape[1] == 0 or not np.any(valid_mask):
-            return np.zeros((n_x, n_m, 2), dtype=np.float32)
-
-        # Broadcast: (n_x, 1, 1, 2) - (1, n_m, max_occupied, 2) -> (n_x, n_m, max_occupied, 2)
-        diff = X_batch[:, np.newaxis, np.newaxis, :] - m_positions[np.newaxis, :, :, :]
-        d = np.linalg.norm(diff, axis=3)
-
-        # Mask: valid cells within max_D range
-        mask = (d <= 10.0) & valid_mask[np.newaxis, :, :]
-        inv_d3 = (1.0 / np.maximum(d, 1e-6)**3) * mask
-
-        # Repulsive force: sum over occupied cells
-        forces = (-self.force_constant * diff) * inv_d3[:, :, :, np.newaxis]
-        return np.sum(forces, axis=2)
-
-    def c_vectorized_batch(self, M_batch: np.ndarray, U_batch: np.ndarray, X_known: np.ndarray = None) -> np.ndarray:
+    def c(self, M_batch: np.ndarray, U_batch: np.ndarray, X_known: np.ndarray = None) -> np.ndarray:
         """
         Batched cost computation: c(m, u) for all (m, u) pairs.
 
@@ -333,29 +321,14 @@ class Mapping_POMDP(BasePOMDP):
         Returns:
             c_batch: (n_m, n_u) where c_batch[i, j] = c(M_batch[i], U_batch[j])
         """
-        if X_known is None:
-            if self.known_pose is None:
-                raise ValueError("X_known must be provided or self.known_pose must be set")
-            X_known = self.known_pose
 
-        if M_batch.ndim == 2:
-            M_batch = M_batch[np.newaxis, :, :]
         if U_batch.ndim == 1:
             U_batch = U_batch[np.newaxis, :]
-
-        x_pos = X_known[:2] if len(X_known) > 2 else X_known
-        x_pos_batch = np.broadcast_to(x_pos[np.newaxis, :], (M_batch.shape[0], 2))
 
         # Effort cost: ||u||_2
         effort = np.linalg.norm(U_batch, axis=1)[np.newaxis, :]
 
-        # VFF cost: repulsive force alignment
-        F_r = self.F_r_vectorized_batch(x_pos_batch, M_batch)[:, 0, :]
-        dot_prod = np.dot(F_r, U_batch.T)
-        norms = np.linalg.norm(F_r, axis=1, keepdims=True) * np.linalg.norm(U_batch, axis=1)[np.newaxis, :]
-        vff = np.maximum(0, dot_prod / (norms + 1e-6))
-
-        return effort + vff
+        return effort
 
     ##########################################################
     ### 2. Ray Casting #######################################
@@ -363,54 +336,54 @@ class Mapping_POMDP(BasePOMDP):
         """
         Batched ray casting for multiple maps simultaneously.
 
-        Args:
-            X: robot positions (m_n, 2)
-            M: occupancy grids (len_M, H, W)
-        Returns:
-            y_star_all: distances (m_n, len_M, B)
-        """
-        return self.sensor.g_bar_batched(X, M, self.map)
-
-    ##########################################################
-    ### 3. Observation Models ###############################
-    def Q_vectorized_batch(self, Y_batch: np.ndarray) -> np.ndarray:
-        """
-        Batched Q computation: Q(y | x_known, m) for all (y, m) pairs.
+        Supports both LIDAR (with occupancy grids) and RangeBearingSensor (with landmark maps).
+        Both sensors handle batching internally - just call g_bar().
 
         Args:
-            Y_batch: observations (n_obs, B)
+            X: robot states
+               - For LIDAR: (m_n, 2) positions
+               - For RangeBearingSensor: (m_n, state_dim) where state_dim can be:
+                 * 2: (p_x, p_y) - bearings relative to x-axis
+                 * 3: (p_x, p_y, θ) - bearings relative to robot heading
+                 * 4: (p_x, p_y, v_x, v_y) - bearings relative to x-axis
+            M: maps - either:
+               - occupancy grids (len_M, H, W) for LIDAR
+               - map representations (len_M, num_candidate_landmarks) for LandmarkMap
         Returns:
-            Q_batch: (n_obs, len_M) where Q_batch[k, j] = Q(Y_batch[k] | x_known, maps[j])
+            y_star_all: observations
+               - For LIDAR: (m_n, len_M, B) distances
+               - For RangeBearingSensor: (m_n, len_M, num_candidate_landmarks, 2) [range, bearing]
         """
-        return np.exp(self.Q_log_vectorized_batch(Y_batch))
+        if isinstance(self.sensor, RangeBearingSensor):
+            # For ordered landmark maps, M is already (len_M, l, 2)
+            if isinstance(self.map, OrderedLandmarkMap):
+                return self.sensor.g_bar(X, M)
 
-    def Q_log_vectorized_batch(self, Y_batch: np.ndarray) -> np.ndarray:
-        """
-        Batched log Q computation: log Q(y | x_known, m) for all (y, m) pairs.
+            # For subset-encoded LandmarkMap, convert binary vectors to positions
+            from .mapping import LandmarkMap
+            if isinstance(self.map, LandmarkMap):
+                all_candidate_positions = self.map.landmark_positions  # (num_candidate_landmarks, 2)
+                num_candidates = all_candidate_positions.shape[0]
+                landmark_positions_list = []
+                for m_repr in M:
+                    active_mask = m_repr.flatten() > 0
+                    landmark_pos = np.full((num_candidates, 2), np.nan)
+                    landmark_pos[active_mask] = all_candidate_positions[active_mask]
+                    landmark_positions_list.append(landmark_pos)
 
-        Args:
-            Y_batch: observations (n_obs, B)
-        Returns:
-            log_Q_batch: (n_obs, len_M) where log_Q_batch[k, j] = log Q(Y_batch[k] | x_known, maps[j])
-        """
-        if self.known_pose is None:
-            raise ValueError("Known pose not set. Set self.known_pose first.")
-        if not hasattr(self, 'all_maps_3d') or self.all_maps_3d is None:
-            raise ValueError(
-                "Q_log_vectorized_batch requires all_maps_3d to be precomputed. "
-                f"Map space too large (H*W={getattr(self, 'map_H', '?')}*{getattr(self, 'map_W', '?')} > 16)."
-            )
+                landmark_positions = np.stack(landmark_positions_list, axis=0)
+                return self.sensor.g_bar(X, landmark_positions)
 
-        x_pos = self.known_pose[:2] if len(self.known_pose) > 2 else self.known_pose
-        y_star = self.ray_casting_batched(x_pos[np.newaxis, :], self.all_maps_3d)[0]
+            raise ValueError("RangeBearingSensor requires LandmarkMap or OrderedLandmarkMap")
+        else:
+            # For LIDAR, call g_bar with map object
+            return self.sensor.g_bar(X, M, self.map)
 
-        y_diff = Y_batch[:, np.newaxis, :] - y_star[np.newaxis, :, :]
-        log_const = -0.5 * self.sensor.B * np.log(2 * np.pi) - self.sensor.B * np.log(self.σ_v)
-        squared_diff = np.sum(y_diff ** 2, axis=2)
-        return log_const - 0.5 * squared_diff / (np.square(self.σ_v))
 
     ##########################################################
     ### 3. Map Space Utilities ##############################
+
+
     def generate_space_of_maps(self, method='bit_iteration', callback=None, show_progress=False, desc=None):
         """
         Generate maps from the space M = {0,1}^{HW} efficiently.
@@ -425,8 +398,18 @@ class Mapping_POMDP(BasePOMDP):
             If callback is None: Array of shape (num_maps, H*W)
             If callback is provided: None (maps are processed via callback)
         """
-        H = self.map.occupancy_map.height
-        W = self.map.occupancy_map.width
+        # Get map dimensions - works for both occupancy grids and landmark maps
+        map_shape = self.map.map_shape
+        if len(map_shape) == 2:
+            H, W = map_shape
+        else:
+            # For landmark maps, we still need H and W for bit iteration
+            # Use a default or raise error - this method is occupancy-grid specific
+            if hasattr(self.map, 'occupancy_map'):
+                H = self.map.occupancy_map.height
+                W = self.map.occupancy_map.width
+            else:
+                raise ValueError("generate_space_of_maps with bit_iteration requires occupancy grid maps")
         total_cells = H * W
         total_maps = 2 ** total_cells
 
@@ -438,7 +421,7 @@ class Mapping_POMDP(BasePOMDP):
                 if show_progress and _tqdm_available:
                     iterator = tqdm(iterator, desc=desc or "Generating maps", leave=False, unit="map")
                 for map_bits in iterator:
-                    map_array = self.bits_to_map(map_bits, (H, W))
+                    map_array = self.map.id_to_map(map_bits, (H, W))
                     maps.append(map_array.flatten())
                 return np.array(maps)
             else:
@@ -455,7 +438,7 @@ class Mapping_POMDP(BasePOMDP):
                         # Standalone progress bar
                         iterator = tqdm(iterator, desc=desc or "Processing maps", leave=False, unit="map")
                 for map_bits in iterator:
-                    map_array = self.bits_to_map(map_bits, (H, W))
+                    map_array = self.map.id_to_map(map_bits, (H, W))
                     callback(map_bits, map_array)
                 return None
 
@@ -476,55 +459,12 @@ class Mapping_POMDP(BasePOMDP):
         Generate all maps as a 3D array for vectorized operations.
 
         Returns:
-            maps_3d: Array of shape (num_maps, H, W) containing all possible maps
+            maps_3d: Array of shape (num_maps, ...) containing all possible maps
             map_bits: Array of shape (num_maps,) containing the bit representation for each map
         """
-        H = self.map.occupancy_map.height
-        W = self.map.occupancy_map.width
-        total_cells = H * W
-        total_maps = 2 ** total_cells
-
-        maps_3d = []
-        map_bits_list = []
-
-        iterator = range(total_maps)
-        if show_progress and _tqdm_available:
-            iterator = tqdm(iterator, desc="Generating all maps", leave=False, unit="map")
-
-        for map_bits in iterator:
-            map_array = self.bits_to_map(map_bits, (H, W))
-            maps_3d.append(map_array)
-            map_bits_list.append(map_bits)
-
-        # Stack into 3D array: (num_maps, H, W)
-        maps_3d_array = np.stack(maps_3d, axis=0)
-        map_bits_array = np.array(map_bits_list, dtype=np.int64)
-
-        return maps_3d_array, map_bits_array
-
-    def map_to_bits(self, m: np.ndarray) -> int:
-        """
-        Encode an occupancy grid m \in {0,1}^{H\times W} into an integer by row-major bits.
-
-        Bit k corresponds to m.flat[k] (row-major order), with least-significant bit = index 0.
-        """
-        flat = np.asarray(m, dtype=np.uint8).ravel(order='C')
-        bits = 0
-        for idx, v in enumerate(flat):
-            if v:
-                bits |= (1 << idx)
-        return bits
-
-    def bits_to_map(self, bits: int, shape: tuple[int, int]) -> np.ndarray:
-        """
-        Decode integer bits into an occupancy grid of given shape (H,W), row-major.
-        """
-        H, W = shape
-        total = H * W
-        out = np.zeros(total, dtype=np.uint8)
-        for k in range(total):
-            out[k] = (bits >> k) & 1
-        return out.reshape((H, W), order='C')
+        # Use the map's generate_all_maps method
+        maps_array, map_bits_array = self.map.generate_all_maps(show_progress=show_progress)
+        return maps_array, map_bits_array
 
     def _symmetry_transforms(self, m: np.ndarray) -> list[np.ndarray]:
         """
@@ -559,8 +499,18 @@ class Mapping_POMDP(BasePOMDP):
         - If as_numpy and total_bits<=64: return a NumPy array of chosen dtype with values [0..2^{HW}-1].
         - Otherwise: return a Python list of ints.
         """
-        H = self.map.occupancy_map.height
-        W = self.map.occupancy_map.width
+        # Get map dimensions - works for both occupancy grids and landmark maps
+        map_shape = self.map.map_shape
+        if len(map_shape) == 2:
+            H, W = map_shape
+        else:
+            # For landmark maps, we still need H and W for bit iteration
+            # Use a default or raise error - this method is occupancy-grid specific
+            if hasattr(self.map, 'occupancy_map'):
+                H = self.map.occupancy_map.height
+                W = self.map.occupancy_map.width
+            else:
+                raise ValueError("generate_space_of_maps with bit_iteration requires occupancy grid maps")
         total_bits = H * W
         total_maps = 1 << total_bits
 
@@ -589,7 +539,7 @@ class SLAM_POMDP(Localization_POMDP, Mapping_POMDP):
     Uses multiple inheritance from Localization_POMDP and Mapping_POMDP to combine:
     - Transition kernel T() from Localization_POMDP
     - Map space utilities from Mapping_POMDP
-    - Ray casting methods from Mapping_POMDP (ray_casting_batched for occupancy grids)
+    - Ray casting methods from Mapping_POMDP (supports both LIDAR and RangeBearingSensor)
 
     Method Resolution Order (MRO): SLAM_POMDP -> Localization_POMDP -> Mapping_POMDP -> BasePOMDP
     - Methods defined in SLAM_POMDP override parent methods
@@ -598,9 +548,13 @@ class SLAM_POMDP(Localization_POMDP, Mapping_POMDP):
 
     State space: Joint (x, m) where:
     - x: Robot pose (2D or 4D)
-    - m: Occupancy grid map
+    - m: Map (occupancy grid or landmark map)
 
     Belief space: π(x, m) - joint belief over pose and map.
+
+    Supports multiple sensor and map combinations:
+    - LIDAR sensor with LidarGridMapVec (occupancy grids)
+    - RangeBearingSensor with LandmarkMap (landmark-based maps)
 
     Extends both Localization_POMDP and Mapping_POMDP with SLAM-specific functionality:
     - Observation models Q(y | x, m) that depend on both pose and map
@@ -615,83 +569,17 @@ class SLAM_POMDP(Localization_POMDP, Mapping_POMDP):
 
     ###########################################################
     ### Cost Functions #####################################
-    def c_vectorized_batch(self, X_batch: np.ndarray, M_batch: np.ndarray, U_batch: np.ndarray) -> np.ndarray:
+    def c_effort(self, U_batch: np.ndarray) -> np.ndarray:
         """
-        Batched cost computation: c(x, m, u) for all (x, m, u) combinations.
+        Batched cost computation: c_effort(u) for all (u) pairs.
 
         Args:
-            X_batch: states (n_x, state_dim) or (state_dim,)
-            M_batch: maps (n_m, H, W) or (H, W)
             U_batch: actions (n_u, 2) or (2,)
         Returns:
-            c_batch: (n_x, n_m, n_u) where c_batch[i, j, k] = c(X_batch[i], M_batch[j], U_batch[k])
+            c_effort_batch: (n_u,) where c_effort_batch[i] = c_effort(U_batch[i])
         """
-        if X_batch.ndim == 1:
-            X_batch = X_batch[np.newaxis, :]
-        if M_batch.ndim == 2:
-            M_batch = M_batch[np.newaxis, :, :]
-        if U_batch.ndim == 1:
-            U_batch = U_batch[np.newaxis, :]
-
-        n_x, n_m, n_u = X_batch.shape[0], M_batch.shape[0], U_batch.shape[0]
-        X_pos = X_batch[:, :2] if X_batch.shape[1] > 2 else X_batch
-
-        # Effort cost
-        effort = np.linalg.norm(U_batch, axis=1)[np.newaxis, np.newaxis, :]
-
-        # VFF cost: compute F_r for all (x, m) pairs
-        X_pos_expanded = np.repeat(X_pos[:, np.newaxis, :], n_m, axis=1)
-        M_expanded = np.repeat(M_batch[np.newaxis, :, :, :], n_x, axis=0)
-        F_r = self.F_r_vectorized_batch(X_pos_expanded.reshape(-1, 2),
-                                        M_expanded.reshape(-1, *M_batch.shape[1:]))[:, 0, :]
-        F_r = F_r.reshape(n_x, n_m, 2)
-
-        # Dot products and norms
-        dot_prod = np.sum(F_r[:, :, np.newaxis, :] * U_batch[np.newaxis, np.newaxis, :, :], axis=3)
-        norms = np.linalg.norm(F_r, axis=2, keepdims=True) * np.linalg.norm(U_batch, axis=1)[np.newaxis, np.newaxis, :]
-        vff = np.maximum(0, dot_prod / (norms + 1e-6))
-
-        return effort + vff
-
+        return np.linalg.norm(U_batch, axis=1)
     ##########################################################
-    ### Observation Models ###################################
-    def Q_vectorized_batch(self, Y_batch: np.ndarray, X: np.ndarray) -> np.ndarray:
-        """
-        Batched Q computation: Q(y | x, m) for all (y, x, m) pairs.
-
-        Overrides parent implementations to handle both pose and map.
-
-        Args:
-            Y_batch: observations (n_obs, B)
-            X: states (m_n, state_dim)
-        Returns:
-            Q_batch: (n_obs, m_n, len_M) where Q_batch[k, i, j] = Q(Y_batch[k] | X[i], maps[j])
-        """
-        return np.exp(self.Q_log_vectorized_batch(Y_batch, X))
-
-    def Q_log_vectorized_batch(self, Y_batch: np.ndarray, X: np.ndarray) -> np.ndarray:
-        """
-        Batched log Q computation: log Q(y | x, m) for all (y, x, m) pairs.
-
-        Args:
-            Y_batch: observations (n_obs, B)
-            X: states (m_n, state_dim)
-        Returns:
-            log_Q_batch: (n_obs, m_n, len_M) where log_Q_batch[k, i, j] = log Q(Y_batch[k] | X[i], maps[j])
-        """
-        if not hasattr(self, 'all_maps_3d') or self.all_maps_3d is None:
-            raise ValueError(
-                "Q_log_vectorized_batch requires all_maps_3d to be precomputed. "
-                f"Map space too large (H*W={getattr(self, 'map_H', '?')}*{getattr(self, 'map_W', '?')} > 16)."
-            )
-
-        X_pos = X[:, :2] if X.shape[1] > 2 else X
-        y_star = self.ray_casting_batched(X_pos, self.all_maps_3d)
-
-        y_diff = Y_batch[:, np.newaxis, np.newaxis, :] - y_star[np.newaxis, :, :, :]
-        log_const = -0.5 * self.sensor.B * np.log(2 * np.pi) - self.sensor.B * np.log(self.σ_v)
-        squared_diff = np.sum(y_diff ** 2, axis=3)
-        return log_const - 0.5 * squared_diff / (np.square(self.σ_v))
 
 
 # Backward compatibility: Maintain POMDP as alias for SLAM_POMDP

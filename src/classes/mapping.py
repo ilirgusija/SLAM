@@ -4,10 +4,484 @@ import matplotlib.pyplot as plt
 from ..utils.array_backend import np
 
 from ..utils.map import bresenham_vec
+from abc import ABC, abstractmethod
+from typing import Optional, Tuple
+
 
 EXTEND_AREA = 1.0
 FREE = 0.0
 OCCUPIED = 1.0
+"""
+Abstract base class for map representations.
+
+This module provides an abstract interface for different map types (occupancy grids,
+landmark-based maps, etc.) to be used interchangeably in POMDP and Belief-MDP classes.
+"""
+
+
+class BaseMap(ABC):
+    """
+    Abstract base class for map representations.
+
+    Subclasses must implement:
+    - Map space generation (for belief-MDP)
+    - Map distance/metric (d_M)
+    - Map representation conversion (for ray casting, belief states)
+    - Properties: len_M (number of possible maps), map_shape (for grids)
+    """
+
+    def __init__(self, x_min: float, x_max: float, y_min: float, y_max: float):
+        """
+        Initialize map with bounds.
+
+        Args:
+            x_min, x_max, y_min, y_max: Bounds of the map in world coordinates
+        """
+        self.x_min = x_min
+        self.x_max = x_max
+        self.y_min = y_min
+        self.y_max = y_max
+        self.left_lower = np.array([x_min, y_min])
+        self.right_upper = np.array([x_max, y_max])
+
+    @property
+    @abstractmethod
+    def len_M(self) -> int:
+        """
+        Number of possible maps in the map space M.
+
+        Returns:
+            int: Total number of possible maps
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def map_shape(self) -> Tuple[int, ...]:
+        """
+        Shape of individual map representation.
+
+        For occupancy grids: (H, W)
+        For landmark maps: (num_landmarks, 2) or similar
+
+        Returns:
+            Tuple[int, ...]: Shape of a single map
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def d_M(self, m1: np.ndarray, m2: np.ndarray) -> float:
+        """
+        Metric on the map space.
+
+        Computes distance between two maps.
+
+        Args:
+            m1: First map representation
+            m2: Second map representation
+
+        Returns:
+            float: Distance between m1 and m2
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def generate_all_maps(self, show_progress: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Generate all possible maps in the map space.
+
+        Args:
+            show_progress: Whether to show progress bar
+
+        Returns:
+            Tuple of (maps_array, map_ids):
+            - maps_array: Array of all maps, shape (len_M, ...) where ... is map_shape
+            - map_ids: Optional array of map identifiers (e.g., bit representations for grids)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def map_to_id(self, m: np.ndarray) -> int:
+        """
+        Convert a map representation to a unique identifier.
+
+        Args:
+            m: Map representation
+
+        Returns:
+            int: Unique identifier for the map
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def id_to_map(self, map_id: int) -> np.ndarray:
+        """
+        Convert a map identifier to a map representation.
+
+        Args:
+            map_id: Unique identifier for the map
+
+        Returns:
+            np.ndarray: Map representation
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_obstacle_segments(self, m: np.ndarray) -> list:
+        """
+        Extract obstacle segments from a map for ray casting.
+
+        Args:
+            m: Map representation
+
+        Returns:
+            list: List of obstacle segments, where each segment is (x1, y1, x2, y2)
+        """
+        raise NotImplementedError
+
+    def get_obstacle_segments_batched(self, M: np.ndarray) -> list:
+        """
+        Extract obstacle segments from multiple maps for batched ray casting.
+
+        Default implementation calls get_obstacle_segments for each map.
+        Subclasses can override for more efficient batched operations.
+
+        Args:
+            M: Array of maps, shape (n_maps, ...)
+
+        Returns:
+            list: List of obstacle segments for all maps
+        """
+        all_segments = []
+        for i in range(M.shape[0]):
+            segments = self.get_obstacle_segments(M[i])
+            all_segments.extend(segments)
+        return all_segments
+
+    # Compatibility properties for occupancy grids
+    @property
+    def height(self) -> Optional[int]:
+        """
+        Height of the map (for occupancy grids).
+
+        Returns:
+            int if applicable, None otherwise
+        """
+        if hasattr(self, 'occupancy_map'):
+            return getattr(self.occupancy_map, 'height', None)
+        return None
+
+    @property
+    def width(self) -> Optional[int]:
+        """
+        Width of the map (for occupancy grids).
+
+        Returns:
+            int if applicable, None otherwise
+        """
+        if hasattr(self, 'occupancy_map'):
+            return getattr(self.occupancy_map, 'width', None)
+        return None
+
+class LandmarkMap(BaseMap):
+    """
+    Landmark-based map representation.
+
+    Maps are represented as sets of landmarks, where each landmark is a point (x, y).
+    The map space consists of all possible combinations of landmarks from a discrete set.
+    """
+
+    def __init__(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        landmark_positions: np.ndarray,
+        max_landmarks: Optional[int] = None
+    ):
+        """
+        Initialize landmark map.
+
+        Args:
+            x_min, x_max, y_min, y_max: Bounds of the map
+            landmark_positions: Array of shape (num_candidate_landmarks, 2) with candidate landmark positions
+            max_landmarks: Maximum number of landmarks in a map. If None, uses num_candidate_landmarks
+        """
+        super().__init__(x_min, x_max, y_min, y_max)
+        self.landmark_positions = np.asarray(landmark_positions)  # (N, 2)
+        self.num_candidate_landmarks = self.landmark_positions.shape[0]
+        self.max_landmarks = max_landmarks if max_landmarks is not None else self.num_candidate_landmarks
+
+        # Map space: all subsets of landmarks (2^N possible maps)
+        # Each map is represented as a binary vector indicating which landmarks are present
+        self._len_M = 2 ** self.num_candidate_landmarks
+
+    @property
+    def len_M(self) -> int:
+        """Number of possible maps: 2^N where N is number of candidate landmarks."""
+        return self._len_M
+
+    @property
+    def map_shape(self) -> Tuple[int, ...]:
+        """
+        Shape of individual map representation.
+
+        For landmark maps, this is (num_candidate_landmarks,) - a binary vector.
+        """
+        return (self.num_candidate_landmarks,)
+
+    def d_M(self, m1: np.ndarray, m2: np.ndarray, p: float = 2.0) -> float:
+        """
+        Metric on the map space: Lp norm between landmark indicator vectors.
+
+        For landmark maps, this is simply the Lp norm of the difference between
+        binary indicator vectors. The Lp-Hausdorff metric reduces to this for
+        discrete point sets.
+
+        Args:
+            m1: First map as binary vector (num_candidate_landmarks,)
+            m2: Second map as binary vector (num_candidate_landmarks,)
+            p: Lp norm parameter (default: 2.0 for L2 norm)
+                Use p=float('inf') for L∞ norm
+
+        Returns:
+            float: Lp distance between maps
+        """
+        m1_flat = m1.flatten() if m1.ndim > 1 else m1
+        m2_flat = m2.flatten() if m2.ndim > 1 else m2
+        diff = m1_flat - m2_flat
+
+        if p == float('inf'):
+            return float(np.max(np.abs(diff)))
+        else:
+            return float(np.linalg.norm(diff, ord=p))
+
+    def generate_all_maps(self, show_progress: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Generate all possible landmark maps.
+
+        Args:
+            show_progress: Whether to show progress bar
+
+        Returns:
+            Tuple of (maps_array, map_ids):
+            - maps_array: Array of shape (len_M, num_candidate_landmarks) with binary vectors
+            - map_ids: Array of shape (len_M,) with integer IDs (same as bit representation)
+        """
+        try:
+            from tqdm import tqdm
+            _tqdm_available = True
+        except ImportError:
+            _tqdm_available = False
+
+        total_maps = self.len_M
+        maps_list = []
+        map_ids_list = []
+
+        iterator = range(total_maps)
+        if show_progress and _tqdm_available:
+            iterator = tqdm(iterator, desc="Generating all landmark maps", leave=False, unit="map")
+
+        for map_id in iterator:
+            map_array = self.id_to_map(map_id)
+            maps_list.append(map_array)
+            map_ids_list.append(map_id)
+
+        maps_array = np.stack(maps_list, axis=0)  # (len_M, num_candidate_landmarks)
+        map_ids_array = np.array(map_ids_list, dtype=np.int64)
+
+        return maps_array, map_ids_array
+
+    def map_to_id(self, m: np.ndarray) -> int:
+        """
+        Convert a landmark map to a unique identifier.
+
+        The ID is the bit representation of the binary vector.
+
+        Args:
+            m: Map as binary vector (num_candidate_landmarks,)
+
+        Returns:
+            int: Unique identifier (bit representation)
+        """
+        m_flat = np.asarray(m, dtype=np.uint8).ravel()
+        map_id = 0
+        for idx, v in enumerate(m_flat):
+            if v:
+                map_id |= (1 << idx)
+        return map_id
+
+    def id_to_map(self, map_id: int) -> np.ndarray:
+        """
+        Convert a map identifier to a landmark map representation.
+
+        Args:
+            map_id: Unique identifier (bit representation)
+
+        Returns:
+            np.ndarray: Binary vector (num_candidate_landmarks,) indicating which landmarks are present
+        """
+        out = np.zeros(self.num_candidate_landmarks, dtype=np.uint8)
+        for k in range(self.num_candidate_landmarks):
+            out[k] = (map_id >> k) & 1
+        return out
+
+    def get_obstacle_segments(self, m: np.ndarray) -> list:
+        """
+        Extract obstacle segments from a landmark map for ray casting.
+
+        For landmark maps, we convert landmarks to small obstacle segments.
+        Each landmark is represented as a small square obstacle.
+
+        Args:
+            m: Map as binary vector (num_candidate_landmarks,)
+
+        Returns:
+            list: List of obstacle segments (x1, y1, x2, y2) for each active landmark
+        """
+        # Get active landmarks
+        active_mask = m.flatten() > 0
+        active_landmarks = self.landmark_positions[active_mask]  # (K, 2)
+
+        # Convert each landmark to a small square obstacle segment
+        # Use a small size (e.g., 0.1 units) for each landmark
+        landmark_size = 0.1
+        half_size = landmark_size / 2.0
+
+        segments = []
+        for landmark_pos in active_landmarks:
+            x, y = landmark_pos[0], landmark_pos[1]
+            # Create a small square: four segments forming a square
+            # Top edge
+            segments.append((x - half_size, y + half_size, x + half_size, y + half_size))
+            # Right edge
+            segments.append((x + half_size, y + half_size, x + half_size, y - half_size))
+            # Bottom edge
+            segments.append((x + half_size, y - half_size, x - half_size, y - half_size))
+            # Left edge
+            segments.append((x - half_size, y - half_size, x - half_size, y + half_size))
+
+        return segments
+
+    def get_landmark_positions(self, m: np.ndarray) -> np.ndarray:
+        """
+        Get actual landmark positions for a given map.
+
+        Args:
+            m: Map as binary vector (num_candidate_landmarks,)
+
+        Returns:
+            np.ndarray: Array of shape (K, 2) with positions of active landmarks
+        """
+        active_mask = m.flatten() > 0
+        return self.landmark_positions[active_mask]
+
+
+class OrderedLandmarkMap(BaseMap):
+    """
+    Ordered landmark map representation with known data association.
+
+    Maps are represented as ordered tuples of landmark positions drawn from a
+    discrete candidate set, so M = X_n^l where l is the number of landmarks.
+    """
+
+    def __init__(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        landmark_positions: np.ndarray,
+        num_landmarks: int
+    ):
+        super().__init__(x_min, x_max, y_min, y_max)
+        self.landmark_positions = np.asarray(landmark_positions)  # (N, 2)
+        self.num_candidate_landmarks = self.landmark_positions.shape[0]
+        self.num_landmarks = int(num_landmarks)
+        self.max_landmarks = self.num_landmarks
+        self._len_M = self.num_candidate_landmarks ** self.num_landmarks
+
+    @property
+    def len_M(self) -> int:
+        return self._len_M
+
+    @property
+    def map_shape(self) -> Tuple[int, ...]:
+        return (self.num_landmarks, 2)
+
+    def d_M(self, m1: np.ndarray, m2: np.ndarray, p: float = 2.0) -> float:
+        m1_flat = m1.reshape(-1) if m1.ndim > 1 else m1
+        m2_flat = m2.reshape(-1) if m2.ndim > 1 else m2
+        diff = m1_flat - m2_flat
+        if p == float('inf'):
+            return float(np.max(np.abs(diff)))
+        return float(np.linalg.norm(diff, ord=p))
+
+    def generate_all_maps(self, show_progress: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        try:
+            from tqdm import tqdm
+            _tqdm_available = True
+        except ImportError:
+            _tqdm_available = False
+
+        N = self.num_candidate_landmarks
+        l = self.num_landmarks
+        
+        # Generate indices in the same order as map_to_id() expects
+        # map_to_id computes: id = idx[0]*N^(l-1) + idx[1]*N^(l-2) + ... + idx[l-1]*N^0
+        # So idx[0] varies slowest, idx[l-1] varies fastest
+        # np.meshgrid with indexing='ij' makes first index vary slowest, which is what we want
+        coords = [np.arange(N) for _ in range(l)]
+        mesh = np.meshgrid(*coords, indexing='ij')  # idx[0] varies slowest, idx[l-1] varies fastest
+        idx_grid = np.stack([m.ravel() for m in mesh], axis=1)  # (len_M, l)
+
+        if show_progress and _tqdm_available:
+            idx_iter = tqdm(idx_grid, desc="Generating ordered landmark maps", leave=False, unit="map")
+            maps_list = [self.landmark_positions[idx] for idx in idx_iter]
+            maps_array = np.stack(maps_list, axis=0)
+        else:
+            maps_array = self.landmark_positions[idx_grid]  # (len_M, l, 2)
+
+        map_ids = np.arange(self.len_M, dtype=np.int64)
+        return maps_array, map_ids
+
+    def map_to_id(self, m: np.ndarray) -> int:
+        if m.ndim == 1 and m.size == self.num_landmarks:
+            indices = m.astype(int)
+        else:
+            # Map provided as positions: find nearest candidate indices
+            diffs = m[:, np.newaxis, :] - self.landmark_positions[np.newaxis, :, :]
+            dist = np.linalg.norm(diffs, axis=2)
+            indices = np.argmin(dist, axis=1)
+
+        N = self.num_candidate_landmarks
+        map_id = 0
+        for idx in indices:
+            map_id = map_id * N + int(idx)
+        return int(map_id)
+
+    def id_to_map(self, map_id: int) -> np.ndarray:
+        N = self.num_candidate_landmarks
+        l = self.num_landmarks
+        indices = []
+        remaining = int(map_id)
+        for _ in range(l):
+            indices.append(remaining % N)
+            remaining //= N
+        indices = indices[::-1]
+        return self.landmark_positions[np.array(indices, dtype=int)]
+
+    def get_landmark_positions(self, m: np.ndarray) -> np.ndarray:
+        if m.ndim == 2 and m.shape[1] == 2:
+            return m
+        if m.ndim == 1 and m.size == self.num_landmarks:
+            return self.landmark_positions[m.astype(int)]
+        return m
+
+    def get_obstacle_segments(self) -> list:
+        """Landmark maps have no obstacle segments."""
+        return []
 
 
 class GridMap:
@@ -672,11 +1146,288 @@ class LidarGridMap:
                 self.occupancy_map.set_value_from_xy_index(ix, iy, OCCUPIED)
 
 
-class LidarGridMapVec:
+class LidarGridMapVec(BaseMap):
     def __init__(self, x_min, x_max, y_min, y_max, quantization_level=5):
+        super().__init__(x_min, x_max, y_min, y_max)
         self.quantization_level = quantization_level
         self.occupancy_map = GridMapNP(
             x_min, x_max, y_min, y_max, quantization_level=self.quantization_level)
+
+    @property
+    def len_M(self) -> int:
+        """Number of possible maps: 2^(H*W) for occupancy grids."""
+        return 2 ** (self.occupancy_map.height * self.occupancy_map.width)
+
+    @property
+    def map_shape(self) -> tuple:
+        """Shape of individual map: (H, W) for occupancy grids."""
+        return (self.occupancy_map.height, self.occupancy_map.width)
+
+    def d_M(self, m1: np.ndarray, m2: np.ndarray, p: float = 2.0) -> float:
+        """
+        Lp-Hausdorff metric on the map space (Baddeley 1992).
+
+        For a finite metric space (X, d), the Lp-Hausdorff distance between two subsets
+        A and B of X is defined as:
+            d_Lp_Haus(A, B) = (Σ_{x∈X} |d(x, A) - d(x, B)|^p)^(1/p)
+
+        where d(x, A) = min_{y∈A} d(x, y) is the point-set distance.
+
+        For discretized occupancy grids:
+        - X is the set of all grid cells (H*W cells)
+        - A and B are the unions of occupied cell squares in m1 and m2
+        - d(x, A) is the minimum distance from point x to any occupied cell surface
+        - Distance is computed in world coordinates
+
+        Args:
+            m1: First occupancy grid (H, W) or flattened
+            m2: Second occupancy grid (H, W) or flattened
+            p: Lp norm parameter (default: 2.0 for L2-Hausdorff)
+                Use p=float('inf') for standard Hausdorff metric
+
+        Returns:
+            float: Lp-Hausdorff distance between m1 and m2
+        """
+        # Reshape to 2D if needed
+        if m1.ndim == 1:
+            m1 = m1.reshape(self.map_shape)
+        if m2.ndim == 1:
+            m2 = m2.reshape(self.map_shape)
+
+        H, W = self.map_shape
+
+        # Occupancy masks for both maps (1 indicates occupied, 0 indicates free)
+        occupied1 = m1 != 0  # (H, W) boolean
+        occupied2 = m2 != 0  # (H, W) boolean
+
+        # If both maps are empty or identical, return 0
+        if np.array_equal(occupied1, occupied2):
+            return 0.0
+
+        # Use grid-cell centers as query points for d(x, A) over the workspace
+        # Grid indexing: i is row (y), j is column (x)
+        # World position: left_lower + (j + 0.5, i + 0.5) * resolution
+        ii, jj = np.indices((H, W))  # (H, W) each
+        cell_positions = np.stack([
+            self.occupancy_map.left_lower[0] + (jj + 0.5) * self.occupancy_map.resolution,
+            self.occupancy_map.left_lower[1] + (ii + 0.5) * self.occupancy_map.resolution
+        ], axis=-1)  # (H, W, 2)
+
+        # Flatten to (H*W, 2)
+        cell_positions_flat = cell_positions.reshape(-1, 2)  # (H*W, 2)
+
+        # Handle edge cases
+        if not np.any(occupied1):
+            # m1 is empty, d(x, m1) = inf for all x (or use a large distance)
+            # For Lp-Hausdorff, we use a large finite distance
+            if not np.any(occupied2):
+                return 0.0
+            # Compute distances from all cells to m2
+            # d(x, m1) = large_value, d(x, m2) = min distance to m2
+            distances_to_m2 = self._compute_point_to_occupied_distances(
+                cell_positions_flat, occupied2)  # (H*W,)
+            large_distance = np.max(distances_to_m2) + 1.0  # Use max distance + buffer
+            if p == float('inf'):
+                return large_distance
+            else:
+                diff = large_distance - distances_to_m2  # (H*W,)
+                return float(np.power(np.sum(np.power(np.abs(diff), p)), 1.0 / p))
+
+        if not np.any(occupied2):
+            # m2 is empty, symmetric to above
+            distances_to_m1 = self._compute_point_to_occupied_distances(
+                cell_positions_flat, occupied1)  # (H*W,)
+            large_distance = np.max(distances_to_m1) + 1.0
+            if p == float('inf'):
+                return large_distance
+            else:
+                diff = distances_to_m1 - large_distance  # (H*W,)
+                return float(np.power(np.sum(np.power(np.abs(diff), p)), 1.0 / p))
+
+        # Compute point-set distances for all cells
+        distances_to_m1 = self._compute_point_to_occupied_distances(
+            cell_positions_flat, occupied1)  # (H*W,)
+        distances_to_m2 = self._compute_point_to_occupied_distances(
+            cell_positions_flat, occupied2)  # (H*W,)
+
+        # Compute Lp-Hausdorff distance
+        diff = distances_to_m1 - distances_to_m2  # (H*W,)
+
+        if p == float('inf'):
+            # Standard Hausdorff metric: max over all cells
+            return float(np.max(np.abs(diff)))
+        else:
+            # Lp-Hausdorff: (Σ |diff|^p)^(1/p)
+            return float(np.power(np.sum(np.power(np.abs(diff), p)), 1.0 / p))
+
+    def _compute_point_set_distances(self, points: np.ndarray, set_points: np.ndarray) -> np.ndarray:
+        """
+        Compute point-set distances: d(x, A) = min_{y∈A} d(x, y) for all x in points.
+
+        Uses vectorized computation for efficiency.
+
+        Args:
+            points: Array of shape (N, 2) - points to compute distances for
+            set_points: Array of shape (M, 2) - points in the set A
+
+        Returns:
+            Array of shape (N,) - minimum distance from each point to the set
+        """
+        if len(set_points) == 0:
+            # Empty set - return large distances
+            return np.full(len(points), np.inf, dtype=np.float64)
+
+        # Compute pairwise distances: (N, M)
+        # Using broadcasting: points[:, None, :] - set_points[None, :, :] -> (N, M, 2)
+        diff = points[:, np.newaxis, :] - set_points[np.newaxis, :, :]  # (N, M, 2)
+        distances = np.linalg.norm(diff, axis=2)  # (N, M) - Euclidean distance
+
+        # Take minimum over set_points (axis=1)
+        min_distances = np.min(distances, axis=1)  # (N,)
+
+        return min_distances
+
+    def _compute_point_to_occupied_distances(self, points: np.ndarray, occupied: np.ndarray) -> np.ndarray:
+        """
+        Compute minimum distances from points to occupied cell surfaces.
+        """
+        if not np.any(occupied):
+            return np.full(points.shape[0], np.inf, dtype=np.float64)
+
+        inds = np.argwhere(occupied)  # (K, 2) rows (y), cols (x)
+        ii = inds[:, 0]
+        jj = inds[:, 1]
+        res = self.occupancy_map.resolution
+        left_lower = self.occupancy_map.left_lower
+
+        rect_min = np.stack([
+            left_lower[0] + jj * res,
+            left_lower[1] + ii * res
+        ], axis=1)  # (K, 2)
+        rect_max = rect_min + res
+
+        px = points[:, 0][:, np.newaxis]  # (N, 1)
+        py = points[:, 1][:, np.newaxis]  # (N, 1)
+
+        dx = np.maximum(rect_min[:, 0][np.newaxis, :] - px, 0.0) + \
+            np.maximum(px - rect_max[:, 0][np.newaxis, :], 0.0)
+        dy = np.maximum(rect_min[:, 1][np.newaxis, :] - py, 0.0) + \
+            np.maximum(py - rect_max[:, 1][np.newaxis, :], 0.0)
+
+        dist = np.sqrt(dx * dx + dy * dy)  # (N, K)
+        return np.min(dist, axis=1)
+
+    def generate_all_maps(self, show_progress: bool = False) -> tuple:
+        """
+        Generate all possible occupancy grid maps.
+
+        Args:
+            show_progress: Whether to show progress bar
+
+        Returns:
+            Tuple of (maps_3d, map_bits):
+            - maps_3d: Array of shape (len_M, H, W)
+            - map_bits: Array of shape (len_M,) with bit representations
+        """
+        try:
+            from tqdm import tqdm
+            _tqdm_available = True
+        except ImportError:
+            _tqdm_available = False
+
+        H, W = self.map_shape
+        total_cells = H * W
+        total_maps = 2 ** total_cells
+
+        maps_3d = []
+        map_bits_list = []
+
+        iterator = range(total_maps)
+        if show_progress and _tqdm_available:
+            iterator = tqdm(iterator, desc="Generating all maps", leave=False, unit="map")
+
+        for map_bits in iterator:
+            map_array = self.bits_to_map(map_bits, (H, W))
+            maps_3d.append(map_array)
+            map_bits_list.append(map_bits)
+
+        maps_3d_array = np.stack(maps_3d, axis=0)
+        map_bits_array = np.array(map_bits_list, dtype=np.int64)
+
+        return maps_3d_array, map_bits_array
+
+    def map_to_id(self, m: np.ndarray) -> int:
+        """
+        Encode an occupancy grid m into an integer by row-major bits.
+
+        Args:
+            m: Occupancy grid (H, W)
+
+        Returns:
+            int: Bit representation of the map
+        """
+        return self.map_to_bits(m)
+
+    def id_to_map(self, map_id: int) -> np.ndarray:
+        """
+        Decode integer bits into an occupancy grid.
+
+        Args:
+            map_id: Bit representation of the map
+
+        Returns:
+            np.ndarray: Occupancy grid (H, W)
+        """
+        return self.bits_to_map(map_id, self.map_shape)
+
+    def map_to_bits(self, m: np.ndarray) -> int:
+        """
+        Encode an occupancy grid m \in {0,1}^{H\times W} into an integer by row-major bits.
+
+        Bit k corresponds to m.flat[k] (row-major order), with least-significant bit = index 0.
+        """
+        flat = np.asarray(m, dtype=np.uint8).ravel(order='C')
+        bits = 0
+        for idx, v in enumerate(flat):
+            if v:
+                bits |= (1 << idx)
+        return bits
+
+    def bits_to_map(self, bits: int, shape: tuple = None) -> np.ndarray:
+        """
+        Decode integer bits into an occupancy grid of given shape (H,W), row-major.
+
+        Args:
+            bits: Bit representation
+            shape: Optional shape (H, W). If None, uses self.map_shape
+        """
+        if shape is None:
+            shape = self.map_shape
+        H, W = shape
+        total = H * W
+        out = np.zeros(total, dtype=np.uint8)
+        for k in range(total):
+            out[k] = (bits >> k) & 1
+        return out.reshape((H, W), order='C')
+
+    def get_obstacle_segments(self, m: np.ndarray) -> list:
+        """
+        Extract obstacle segments from an occupancy grid for ray casting.
+
+        This method delegates to the sensor model's get_obstacles_from_map method
+        which handles connected components extraction. For direct use, call
+        LIDAR.get_obstacles_from_map(m, self) instead.
+
+        Args:
+            m: Occupancy grid (H, W)
+
+        Returns:
+            list: List of obstacle segments (x1, y1, x2, y2)
+        """
+        # The actual implementation requires the sensor model for connected components
+        # This is a placeholder - the sensor model's get_obstacles_from_map should be used
+        # For now, return empty list - the sensor will handle it
+        return []
 
     def seed_from_obstacles(self, obstacles):
         """Rasterize obstacle segments into the occupancy grid as OCCUPIED (1.0)."""

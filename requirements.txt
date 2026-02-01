@@ -6,3 +6,7 @@ pillow
 scikit-learn
 scipy
 tqdm
+# cuVS for CuPy spatial distance functions (cdist)
+# Install with: pip install cuvs-cu12 --extra-index-url=https://pypi.nvidia.com
+# For CUDA 11: pip install cuvs-cu11 --extra-index-url=https://pypi.nvidia.com
+# For CUDA 13: pip install cuvs-cu13 --extra-index-url=https://pypi.nvidia.com

@@ -283,6 +283,43 @@ class HypercubeQuantizer:
             self.build_index()
         return self._bounds
 
+
+class ObservationQuantizer:
+    """
+    Thin wrapper around HypercubeQuantizer for observation spaces.
+
+    This mirrors the pattern of StateQuantizer / ActionQuantizer but for Y.
+    It exposes:
+        - Y_n: grid points in observation space (m_y, dim)
+        - get_bounds(): axis-aligned hyper-rectangular cells (m_y, dim, 2)
+    """
+
+    def __init__(self, bounds: list[tuple[float, float]], n: int):
+        """
+        Args:
+            bounds: List of (min, max) per observation dimension.
+            n: Number of quantization cells per dimension.
+        """
+        self._quantizer = HypercubeQuantizer(bounds, n)
+
+    @property
+    def Y_n(self):
+        """Observation grid points, shape (m_y, dim)."""
+        return self._quantizer.points
+
+    @property
+    def m_y(self) -> int:
+        """Number of observation points |Y_n|."""
+        return self._quantizer.n_points
+
+    def get_bounds(self):
+        """
+        Axis-aligned hyper-rectangular bounds for each observation point.
+
+        Shape: (m_y, dim, 2)
+        """
+        return self._quantizer.get_bounds()
+
     def find_nearest(self, x: np.ndarray):
         """Find nearest quantized point using KDTree"""
         if not hasattr(self, '_kdtree'):

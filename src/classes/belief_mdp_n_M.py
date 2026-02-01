@@ -1,9 +1,10 @@
 # import cupy as np
 import hashlib
 from pathlib import Path
+from typing import Literal
 from .belief_mdp_n import BeliefMDP_n_SLAM, BeliefMDP_n_Localization, BeliefMDP_n_Mapping
-from .mapping import LidarGridMapVec
-from .model import LIDAR, SingleIntegratorModel, DoubleIntegratorModel
+from .mapping import BaseMap, LidarGridMapVec
+from .model import LIDAR, RangeBearingSensor, SingleIntegratorModel, DoubleIntegratorModel
 from .obstacle import Obstacle
 from .quantizer import BeliefQuantizer
 from ..utils.array_backend import np, random, is_cupy
@@ -250,10 +251,33 @@ class BeliefMDP_n_M_SLAM(BeliefMDP_n_SLAM, BaseBeliefMDP_n_M):
     def N_n(self) -> int:
         return self.SQ.m_n * self.len_M
 
-    def __init__(self, M: int, β: float, n: int, motion_model: SingleIntegratorModel | DoubleIntegratorModel,
-                 measurement_model: LIDAR, obstacles: list[Obstacle], _map: LidarGridMapVec,
-                 sigma_w: float = 0.01, sigma_v: float = 1.0):
-        super().__init__(n, motion_model, measurement_model, obstacles, _map, sigma_w, sigma_v)
+    def __init__(
+        self,
+        M: int,
+        β: float,
+        n: int,
+        motion_model: SingleIntegratorModel | DoubleIntegratorModel,
+        measurement_model: LIDAR | RangeBearingSensor,
+        obstacles: list[Obstacle],
+        _map: BaseMap,
+        sigma_w: float = 0.01,
+        sigma_v: float = 0.01,
+        exploration_type: Literal['information gain', 'wasserstein distance'] = 'information gain',
+        obs_n: int | None = None,
+        action_n: int | None = None
+    ):
+        super().__init__(
+            n,
+            motion_model,
+            measurement_model,
+            obstacles,
+            _map,
+            sigma_w,
+            sigma_v,
+            exploration_type=exploration_type,
+            obs_n=obs_n,
+            action_n=action_n
+        )
         self.M = M
         self.β = β
         self.BQ = BeliefQuantizer(M, self.N_n)
@@ -268,13 +292,27 @@ class BeliefMDP_n_M_SLAM(BeliefMDP_n_SLAM, BaseBeliefMDP_n_M):
         else:
             print("Computing p_n_M for the first time...")
             print(f"This may take a while: {self.AQ.n_u} actions × {self.BQ.cardinality}² belief transitions")
-            j_batch_size = getattr(self, '_test_j_batch_size', 100)
-            self.p_n_M = self._compute_p_n_M(j_batch_size=j_batch_size)
+            # Use None to process all j targets at once for maximum GPU utilization
+            # Use i_batch_size=3 to process multiple beliefs simultaneously
+            j_batch_size = getattr(self, '_test_j_batch_size', None)
+            i_batch_size = getattr(self, '_test_i_batch_size', 5)
+            self.p_n_M = self._compute_p_n_M(j_batch_size=j_batch_size, i_batch_size=i_batch_size)
             self._save_p_n_M(cache_path, self.p_n_M)
             print(f"Saved p_n_M to {cache_path}")
 
+        # Load or compute c_n_M (cost matrix) for all belief-action pairs
+        c_n_M_cache_path = self._get_c_n_M_cache_path()
+        if self._load_c_n_M(c_n_M_cache_path):
+            print(f"Loaded cached c_n_M from {c_n_M_cache_path}")
+        else:
+            print("Computing c_n_M for the first time...")
+            print(f"This will compute costs for {self.BQ.cardinality:,} beliefs × {self.AQ.n_u} actions")
+            self._c_n_M_matrix = self._compute_c_n_M()
+            self._save_c_n_M(c_n_M_cache_path, self._c_n_M_matrix)
+            print(f"Saved c_n_M to {c_n_M_cache_path}")
+
     def _get_p_n_M_cache_path(self) -> Path:
-        return self._get_cache_path('p_n_M_slam', 'v2-sparse-float16')
+        return BaseBeliefMDP_n_M._get_cache_path(self, 'p_n_M_slam', 'v2-sparse-float16')
 
     def _save_p_n_M(self, cache_path: Path, p_n_M: list) -> None:
         self._save_sparse_p_n_M(cache_path, p_n_M, 'v2-sparse-float16')
@@ -282,184 +320,158 @@ class BeliefMDP_n_M_SLAM(BeliefMDP_n_SLAM, BaseBeliefMDP_n_M):
     def _load_p_n_M(self, cache_path: Path) -> bool:
         return self._load_sparse_p_n_M(cache_path, 'v2-sparse-float16')
 
-    def η_n(self, j: int, i: int, u: np.ndarray, n_samples: int = 24000, seed: int = None, batch_size: int = 24000, show_progress: bool = True) -> float:
+    def η_n(self, j: int, i: int, u: np.ndarray) -> float:
         """
         Overloaded η_n that takes belief indices instead of belief vectors.
 
-        Computes transition probability η_n(π_j^M | π_i^M, u) via Monte Carlo integration.
-        Accesses beliefs directly from cached codebook self.BQ.Π_n_M, avoiding unnecessary
-        copying of large belief vectors.
-
-        η_n(π_j^M | π_i^M, u) = ∫ 𝟙_{F(π_i^M,u,y) ≈ π_j^M} H(dy | π_i^M, u)
-
-        Uses forward sampling: sample (x', m) ~ Tn_mat @ π_i^M, then sample y ~ Q(y|x',m).
-        Uses batched operations for GPU acceleration.
+        Now delegates to the finite-observation η_n implementation in BeliefMDP_n_SLAM,
+        using quantized beliefs from the codebook Π_n_M.
 
         Args:
-            j: Index of target belief in Π_n_M (i.e., π_j^M = self.BQ.Π_n_M[j])
-            i: Index of current belief in Π_n_M (i.e., π_i^M = self.BQ.Π_n_M[i])
+            j: Index of target belief in Π_n_M (π_j^M)
+            i: Index of current belief in Π_n_M (π_i^M)
             u: Action (2,)
-            n_samples: Number of Monte Carlo samples (default: 24000)
-            seed: Random seed for reproducibility
-            batch_size: Batch size for GPU-accelerated sampling (default: 24000, processes all samples at once)
-            show_progress: Whether to show progress bar (default: True)
         Returns:
             float: Probability of transitioning from π_i^M to π_j^M under action u
         """
-        if seed is not None:
-            random.seed(seed)
+        # Access beliefs directly from cached codebook
+        π_new_flat = self.BQ.Π_n_M[j]  # (N_n,)
+        π_flat = self.BQ.Π_n_M[i]      # (N_n,)
 
-        # Access beliefs directly from cached codebook (no copying)
-        π_new_flat = self.BQ.Π_n_M[j]  # Target belief (N_n,)
-        π_flat = self.BQ.Π_n_M[i]      # Current belief (N_n,)
-
-        # Normalize beliefs to 2D format if needed
         π_new_2d = self.unflatten_belief(π_new_flat)
         π_2d = self.unflatten_belief(π_flat)
 
-        count = 0
-        n_batches = (n_samples + batch_size - 1) // batch_size
+        # Delegate to parent (finite-sum) implementation
+        return super().η_n(π_new_2d, π_2d, u)
 
-        # Sequential processing - simple and reliable
-        batch_iter = tqdm(range(n_batches), desc=f"η_n MC sampling (n={n_samples}, batch={batch_size})",
-                          unit="batch", disable=not show_progress) if show_progress else range(n_batches)
-        for batch_idx in batch_iter:
-            # Determine actual batch size for last batch
-            current_batch_size = min(batch_size, n_samples - batch_idx * batch_size)
-
-            # Batch sample observations
-            Y_batch = self.sample_observations_batch(π_2d, u, current_batch_size)  # (current_batch_size, B)
-
-            # Batch update beliefs using F_batch_log (log-space for numerical stability)
-            π_sampled_batch = self.F_batch_log(π_2d, u, Y_batch)  # (current_batch_size, m_n, len_M)
-
-            # Compute L2 distances for all beliefs in batch
-            # Broadcast π_new_2d: (m_n, len_M) -> (1, m_n, len_M) -> (current_batch_size, m_n, len_M)
-            π_new_broadcast = np.broadcast_to(π_new_2d[np.newaxis, :, :], (current_batch_size, *π_new_2d.shape))
-            distances = np.linalg.norm(π_sampled_batch - π_new_broadcast, axis=(1, 2))  # (current_batch_size,)
-
-            # Count matches
-            count += int(np.sum(distances.get() < 1e-3) if hasattr(distances, 'get') else np.sum(distances < 1e-3))
-
-        return count / n_samples
-
-    def η_n_batch(self, j_list: list[int], i: int, u: np.ndarray, n_samples: int = 24000, seed: int = None,
-                  mc_batch_size: int = 24000, show_progress: bool = True) -> np.ndarray:
+    def η_n_batch(self, j_list: list[int], i: int, u: np.ndarray) -> np.ndarray:
         """
-        Batched version of η_n that processes multiple target beliefs in parallel.
+        Fully vectorized batched version of η_n over multiple target belief indices.
 
-        Computes transition probabilities η_n(π_j^M | π_i^M, u) for multiple j targets simultaneously.
-        This is much more efficient than calling η_n repeatedly because:
-        1. Monte Carlo samples are shared across all j targets
-        2. Belief updates F(π, u, y) are computed once
-        3. Distance computations to all j targets are vectorized
-
-        η_n(π_j^M | π_i^M, u) = ∫ 𝟙_{F(π_i^M,u,y) ≈ π_j^M} H(dy | π_i^M, u)
+        Computes probabilities for all target beliefs simultaneously by:
+        1. Computing H_y and π_all_batch (all updated beliefs for all observations) once
+        2. Vectorized distance computation between all target beliefs and all updated beliefs
+        3. Summing H_y for matching observations for each target belief
 
         Args:
             j_list: List of target belief indices in Π_n_M
-            i: Index of current belief in Π_n_M (i.e., π_i^M = self.BQ.Π_n_M[i])
+            i: Index of current belief in Π_n_M
             u: Action (2,)
-            n_samples: Number of Monte Carlo samples (default: 24000)
-            seed: Random seed for reproducibility
-            mc_batch_size: Batch size for Monte Carlo sampling (default: 24000, processes all at once)
-            show_progress: Whether to show progress bar (default: True)
         Returns:
-            np.ndarray: Array of probabilities, shape (len(j_list),). prob[k] = η_n(π_j_list[k]^M | π_i^M, u)
+            np.ndarray: Array of probabilities, shape (len(j_list),)
         """
-        if seed is not None:
-            random.seed(seed)
-
         if len(j_list) == 0:
             return np.array([])
 
         # Access current belief from codebook
-        π_flat = self.BQ.Π_n_M[i]  # Current belief (N_n,)
-        π_2d = self.unflatten_belief(π_flat)
+        π_flat = self.BQ.Π_n_M[i]  # (N_n,)
+        π_2d = self.unflatten_belief(π_flat)  # (m_n, len_M)
+
+        # Compute H_y and π_all_batch for ALL observations at once (reused for all targets)
+        H_y, π_all_batch = self._compute_H_y_and_F(π_2d, u)
+        # H_y: (m_y,), π_all_batch: (m_y, m_n, len_M)
+        m_y = int(self.Y_n.shape[0])
 
         # Access all target beliefs from codebook
         n_targets = len(j_list)
-        # Convert each belief to backend array (handle both numpy and cupy)
-        π_targets_flat_list = []
-        for j in j_list:
-            π_flat = self.BQ.Π_n_M[j]
-            # Ensure it's a backend array (convert from numpy if needed)
-            if hasattr(π_flat, 'get'):  # CuPy array
-                π_targets_flat_list.append(π_flat)
-            else:  # NumPy array
-                π_targets_flat_list.append(np.asarray(π_flat))
-        π_targets_flat = np.stack(π_targets_flat_list)  # (n_targets, N_n)
+        π_targets_flat = np.array([self.BQ.Π_n_M[j] for j in j_list])  # (n_targets, N_n)
+        π_targets_2d = np.array([self.unflatten_belief(π_flat) for π_flat in π_targets_flat])  # (n_targets, m_n, len_M)
 
-        # Unflatten all beliefs
-        π_targets_2d_list = []
-        for π_flat in π_targets_flat:
-            π_2d = self.unflatten_belief(π_flat)
-            π_targets_2d_list.append(π_2d)
-        π_targets_2d = np.stack(π_targets_2d_list)  # (n_targets, m_n, len_M)
+        # Vectorized distance computation:
+        # π_all_batch: (m_y, m_n, len_M)
+        # π_targets_2d: (n_targets, m_n, len_M)
+        # We want distances: (n_targets, m_y)
+        π_all_flat = π_all_batch.reshape(m_y, -1)  # (m_y, m_n * len_M)
+        π_targets_flat_2d = π_targets_2d.reshape(n_targets, -1)  # (n_targets, m_n * len_M)
 
-        # Initialize counts for each target (use backend array)
-        counts = np.zeros(n_targets, dtype=np.int32)
+        # Compute pairwise distances: (n_targets, m_y)
+        # Using broadcasting: (n_targets, 1, m_n*len_M) - (1, m_y, m_n*len_M) -> (n_targets, m_y, m_n*len_M)
+        π_diff = π_targets_flat_2d[:, np.newaxis, :] - π_all_flat[np.newaxis, :, :]  # (n_targets, m_y, m_n*len_M)
+        distances = np.linalg.norm(π_diff, axis=2)  # (n_targets, m_y)
 
-        # Process Monte Carlo samples in batches
-        n_mc_batches = (n_samples + mc_batch_size - 1) // mc_batch_size
-        batch_iter = tqdm(range(n_mc_batches), desc=f"η_n_batch (n={n_samples}, targets={n_targets}, mc_batch={mc_batch_size})",
-                          unit="batch", disable=not show_progress) if show_progress else range(n_mc_batches)
+        # Vectorized matching: mask observations where distance < threshold for each target
+        threshold = 1e-3
+        matches = (distances < threshold) & (H_y[np.newaxis, :] > 0.0)  # (n_targets, m_y)
 
-        for batch_idx in batch_iter:
-            # Determine actual batch size for last batch
-            current_mc_batch_size = min(mc_batch_size, n_samples - batch_idx * mc_batch_size)
+        # Sum H_y for matching observations for each target belief
+        H_y_broadcast = H_y[np.newaxis, :]  # (1, m_y)
+        probs = np.sum(H_y_broadcast * matches, axis=1)  # (n_targets,)
 
-            # Batch sample observations (shared across all j targets)
-            Y_batch = self.sample_observations_batch(π_2d, u, current_mc_batch_size)  # (current_mc_batch_size, B)
+        return probs.astype(np.float32)
 
-            # Batch update beliefs using F_batch_log (computed once, shared across all j)
-            π_sampled_batch = self.F_batch_log(π_2d, u, Y_batch)  # (current_mc_batch_size, m_n, len_M)
+    def η_n_batch_i_batch(self, j_list: list[int], i_list: list[int], u: np.ndarray) -> np.ndarray:
+        """
+        Fully vectorized batched version of η_n over multiple source and target belief indices.
 
-            # Compute distances to all target beliefs simultaneously
-            # π_sampled_batch: (current_mc_batch_size, m_n, len_M)
-            # π_targets_2d: (n_targets, m_n, len_M)
-            # We want: distances[k, j] = ||π_sampled_batch[k] - π_targets_2d[j]||
+        Processes multiple source beliefs (i) and multiple target beliefs (j) simultaneously.
 
-            # Broadcast for vectorized distance computation
-            # π_sampled_batch: (current_mc_batch_size, 1, m_n, len_M)
-            # π_targets_2d: (1, n_targets, m_n, len_M)
-            # Result: (current_mc_batch_size, n_targets, m_n, len_M)
-            π_sampled_expanded = π_sampled_batch[:, np.newaxis, :, :]  # (current_mc_batch_size, 1, m_n, len_M)
-            π_targets_expanded = π_targets_2d[np.newaxis, :, :, :]  # (1, n_targets, m_n, len_M)
+        Args:
+            j_list: List of target belief indices in Π_n_M
+            i_list: List of source belief indices in Π_n_M
+            u: Action (2,)
+        Returns:
+            np.ndarray: Array of probabilities, shape (len(i_list), len(j_list))
+                       where result[i_idx, j_idx] = η_n(π_j_list[j_idx] | π_i_list[i_idx], u)
+        """
+        if len(j_list) == 0 or len(i_list) == 0:
+            return np.array([]).reshape(len(i_list), len(j_list))
 
-            # Compute L2 distances: (current_mc_batch_size, n_targets)
-            distances = np.linalg.norm(π_sampled_expanded - π_targets_expanded, axis=(2, 3))
+        # Access all source beliefs from codebook
+        n_sources = len(i_list)
+        π_sources_flat = np.array([self.BQ.Π_n_M[i] for i in i_list])  # (n_sources, N_n)
+        π_sources_2d = np.array([self.unflatten_belief(π_flat) for π_flat in π_sources_flat])  # (n_sources, m_n, len_M)
 
-            # Count matches for each target (distance < threshold)
-            matches = distances < 1e-3  # (current_mc_batch_size, n_targets)
+        # Use batched H_y and F computation for all source beliefs at once
+        # Create a batch with single action repeated
+        U_batch = u[np.newaxis, :]  # (1, 2)
+        H_y_batch, π_all_batch = self._compute_H_y_and_F_batched(π_sources_2d, U_batch)
+        # H_y_batch: (n_sources, 1, m_y) -> squeeze to (n_sources, m_y)
+        # π_all_batch: (n_sources, 1, m_y, m_n, len_M) -> squeeze to (n_sources, m_y, m_n, len_M)
+        H_y_batch = H_y_batch[:, 0, :]  # (n_sources, m_y)
+        π_all_batch = π_all_batch[:, 0, :, :, :]  # (n_sources, m_y, m_n, len_M)
 
-            # Sum matches across Monte Carlo samples for each target
-            # Convert to CPU if needed for accumulation
-            if hasattr(matches, 'get'):
-                matches_cpu = matches.get()
-            else:
-                matches_cpu = matches
+        m_y = int(self.Y_n.shape[0])
 
-            # Sum along MC batch dimension to get counts per target
-            batch_counts = np.sum(matches_cpu, axis=0)  # (n_targets,)
-            counts += batch_counts.astype(np.int32)
+        # Access all target beliefs from codebook
+        n_targets = len(j_list)
+        π_targets_flat = np.array([self.BQ.Π_n_M[j] for j in j_list])  # (n_targets, N_n)
+        π_targets_2d = np.array([self.unflatten_belief(π_flat) for π_flat in π_targets_flat])  # (n_targets, m_n, len_M)
 
-        # Convert counts to probabilities (use backend array)
-        counts_array = np.array(counts, dtype=np.float32)
-        probabilities = counts_array / n_samples
+        # Vectorized distance computation for all (source, target, observation) combinations:
+        # π_all_batch: (n_sources, m_y, m_n, len_M)
+        # π_targets_2d: (n_targets, m_n, len_M)
+        # We want distances: (n_sources, n_targets, m_y)
+        π_all_flat = π_all_batch.reshape(n_sources, m_y, -1)  # (n_sources, m_y, m_n * len_M)
+        π_targets_flat_2d = π_targets_2d.reshape(n_targets, -1)  # (n_targets, m_n * len_M)
 
-        return probabilities
+        # Compute pairwise distances: (n_sources, n_targets, m_y)
+        # Broadcasting: (n_sources, 1, m_y, m_n*len_M) - (1, n_targets, 1, m_n*len_M) -> (n_sources, n_targets, m_y, m_n*len_M)
+        π_diff = π_all_flat[:, np.newaxis, :, :] - π_targets_flat_2d[np.newaxis,
+                                                                     :, np.newaxis, :]  # (n_sources, n_targets, m_y, m_n*len_M)
+        distances = np.linalg.norm(π_diff, axis=3)  # (n_sources, n_targets, m_y)
 
-    def _compute_p_n_M(self, n_samples: int = 24000, batch_size: int = 24000, j_batch_size: int = 100,
+        # Vectorized matching: mask observations where distance < threshold
+        threshold = 1e-3
+        matches = (distances < threshold) & (H_y_batch[:, np.newaxis, :] > 0.0)  # (n_sources, n_targets, m_y)
+
+        # Sum H_y for matching observations for each (source, target) pair
+        H_y_broadcast = H_y_batch[:, np.newaxis, :]  # (n_sources, 1, m_y)
+        probs = np.sum(H_y_broadcast * matches, axis=2)  # (n_sources, n_targets)
+
+        return probs.astype(np.float32)
+
+    def _compute_p_n_M(self, j_batch_size: int = None, i_batch_size: int = 3,
                        show_progress: bool = True, threshold: float = 1e-8) -> list:
         """
         Compute the full transition probability matrix p_n^{(M)} over all belief-action pairs.
         Uses sparse matrices (CSR format) with float16 precision for memory efficiency.
 
         Args:
-            n_samples: Number of Monte Carlo samples for η_n computation (default: 24000)
-            batch_size: Batch size for Monte Carlo sampling (default: 24000, processes all at once)
-            j_batch_size: Number of target beliefs (j) to process in parallel (default: 100)
+            j_batch_size: Number of target beliefs (j) to process in parallel. 
+                         If None, processes all targets at once (fastest, requires more GPU memory).
+                         Default: None (process all at once)
+            i_batch_size: Number of source beliefs (i) to process in parallel.
+                         Default: 3 (processes 3 beliefs simultaneously)
             show_progress: Whether to show progress bars
             threshold: Minimum probability threshold (values below this are treated as zero)
 
@@ -469,18 +481,27 @@ class BeliefMDP_n_M_SLAM(BeliefMDP_n_SLAM, BaseBeliefMDP_n_M):
         cardinality = self.BQ.cardinality
         n_u = self.AQ.n_u
 
+        # Auto-determine optimal batch size if not provided
+        if j_batch_size is None:
+            # Process all j targets at once for maximum GPU utilization
+            j_batch_size = cardinality
+            if show_progress:
+                tqdm.write(f"  Auto-selected j_batch_size={j_batch_size} (processing all targets at once)")
+
         # Store as list of sparse matrices (one per action)
         p_n_M_sparse = []
 
         for k in range(n_u):
             u = self.AQ.U[k]
             if show_progress:
-                print(f"Computing p_n_M for action {k+1}/{n_u}...")
-                print(f"  This will compute transitions for {cardinality:,} belief states")
-                print(f"  Each belief state checks {cardinality:,} target beliefs")
-                print(f"  Estimated time per belief state: ~{cardinality * 1.0 / 3600:.1f} hours (at ~1s per η_n call)")
-                print(f"  Total estimated time: ~{cardinality * cardinality * 1.0 / 3600 / 24:.1f} days per action")
-                print(f"  WARNING: This is computationally infeasible! Consider reducing M or using a smarter approach.")
+                tqdm.write(f"Computing p_n_M for action {k+1}/{n_u}...")
+                tqdm.write(f"  This will compute transitions for {cardinality:,} belief states")
+                tqdm.write(f"  Processing {cardinality:,} target beliefs per belief state")
+                tqdm.write(
+                    f"  Using i_batch_size={i_batch_size} (processing {i_batch_size} source beliefs simultaneously)")
+                if j_batch_size < cardinality:
+                    tqdm.write(
+                        f"  Using j_batch_size={j_batch_size} ({(cardinality + j_batch_size - 1) // j_batch_size} batches per belief)")
 
             # Build COO matrix incrementally (row, col, data)
             # Use lists to accumulate, then convert to arrays once
@@ -491,85 +512,93 @@ class BeliefMDP_n_M_SLAM(BeliefMDP_n_SLAM, BaseBeliefMDP_n_M):
             # Test: Only process first belief state to verify it works
             test_mode = False
             if test_mode:
-                print("  TEST MODE: Only processing first belief state")
+                tqdm.write("  TEST MODE: Only processing first belief state")
                 cardinality = 1
 
             # Process belief states with batched η_n for efficiency
             # Batch multiple j targets together to leverage GPU parallelism
 
-            for i in range(cardinality):
-                row_data = []
-                row_cols = []
+            # Progress bar for beliefs (outer loop)
+            pbar = tqdm(range(cardinality),
+                        desc=f"Action {k+1}/{n_u}",
+                        disable=not show_progress,
+                        leave=True,
+                        mininterval=0.5)
 
-                # Sync GPU before starting to ensure previous operations are complete
-                if is_cupy:
-                    import cupy as cp
-                    cp.cuda.Stream.null.synchronize()
+            # Pre-allocate indices lists once
+            j_indices = list(range(cardinality))
+            i_indices = list(range(cardinality))
+            n_j_batches = (cardinality + j_batch_size - 1) // j_batch_size
+            n_i_batches = (cardinality + i_batch_size - 1) // i_batch_size
 
-                # Process j targets in batches
-                j_indices = list(range(cardinality))
-                n_j_batches = (cardinality + j_batch_size - 1) // j_batch_size
+            # Process source beliefs (i) in batches
+            for i_batch_idx in range(n_i_batches):
+                start_i = i_batch_idx * i_batch_size
+                end_i = min(start_i + i_batch_size, cardinality)
+                i_batch = i_indices[start_i:end_i]
 
-                pbar = tqdm(range(n_j_batches),
-                            desc=f"Action {k+1}/{n_u}, Belief {i+1}/{cardinality}",
-                            disable=not show_progress,
-                            leave=False,
-                            mininterval=0.5)
+                # Initialize row data storage for each source belief in this batch
+                batch_row_data = {i: [] for i in i_batch}
+                batch_row_cols = {i: [] for i in i_batch}
 
-                for j_batch_idx in pbar:
+                # Process j targets in batches (or all at once if j_batch_size >= cardinality)
+                for j_batch_idx in range(n_j_batches):
                     # Get batch of j indices
                     start_j = j_batch_idx * j_batch_size
                     end_j = min(start_j + j_batch_size, cardinality)
                     j_batch = j_indices[start_j:end_j]
 
-                    # Compute η_n for all j targets in this batch simultaneously
-                    probs = self.η_n_batch(j_batch, i, u, n_samples=n_samples,
-                                           mc_batch_size=batch_size, show_progress=False)
+                    # Compute η_n for all (i, j) pairs simultaneously
+                    # probs shape: (len(i_batch), len(j_batch))
+                    probs = self.η_n_batch_i_batch(j_batch, i_batch, u)
 
-                    # Extract probabilities (convert from GPU if needed)
+                    # Extract probabilities (convert from GPU if needed for threshold check)
                     if hasattr(probs, 'get'):
                         probs_cpu = probs.get()
                     else:
                         probs_cpu = probs
 
-                    # Store non-zero probabilities
-                    for j_idx, prob in zip(j_batch, probs_cpu):
-                        if prob > threshold:
-                            row_data.append(float(prob))
-                            row_cols.append(j_idx)
+                    # Store non-zero probabilities for each source belief in the batch
+                    for i_idx_in_batch, i in enumerate(i_batch):
+                        for j_idx_in_batch, j in enumerate(j_batch):
+                            prob = probs_cpu[i_idx_in_batch, j_idx_in_batch]
+                            if prob > threshold:
+                                batch_row_data[i].append(float(prob))
+                                batch_row_cols[i].append(j)
 
-                    # Update progress bar
-                    if show_progress:
-                        pbar.set_postfix({'nonzeros': len(row_data), 'j_batch': f'{start_j}-{end_j-1}'})
+                # Normalize and store rows for all source beliefs in this batch
+                for i in i_batch:
+                    row_data = batch_row_data[i]
+                    row_cols = batch_row_cols[i]
 
-                # Sync GPU after each belief state to ensure operations complete
-                if is_cupy:
+                    # Normalize row to ensure probability measure
+                    if row_data:
+                        row_data_arr = np.array(row_data, dtype=np.float32)
+                        row_sum = float(np.sum(row_data_arr))
+                        if row_sum > 0:
+                            row_data_arr = row_data_arr / row_sum
+                            row_data_arr = row_data_arr.astype(np.float16)
+
+                            # Append to lists
+                            rows_list.extend([i] * len(row_cols))
+                            cols_list.extend(row_cols)
+                            data_list.extend(row_data_arr.tolist())
+
+                # Update progress bar
+                if show_progress:
+                    pbar.update(len(i_batch))
+                    pbar.set_postfix({'processed': f'{end_i}/{cardinality}'})
+
+                # Only sync GPU periodically to reduce overhead
+                if is_cupy and i_batch_idx % 10 == 0:
                     import cupy as cp
                     cp.cuda.Stream.null.synchronize()
 
                 # Periodically clear GPU cache to prevent memory issues
-                if is_cupy and i % 100 == 0 and i > 0:
+                if is_cupy and i_batch_idx % 100 == 0 and i_batch_idx > 0:
                     import cupy as cp
                     cp.get_default_memory_pool().free_all_blocks()
                     cp.get_default_pinned_memory_pool().free_all_blocks()
-
-                # Print summary after each belief state
-                if show_progress:
-                    print(f"  Belief {i+1}/{cardinality}: {len(row_data)} non-zero transitions")
-
-                # Normalize row to ensure probability measure
-                if row_data:
-                    row_data_arr = np.array(row_data, dtype=np.float32)  # Use float32 for intermediate computation
-                    row_sum = float(np.sum(row_data_arr))
-                    if row_sum > 0:
-                        row_data_arr = row_data_arr / row_sum
-                        # Convert to float16 for storage
-                        row_data_arr = row_data_arr.astype(np.float16)
-
-                        # Append to lists
-                        rows_list.extend([i] * len(row_cols))
-                        cols_list.extend(row_cols)
-                        data_list.extend(row_data_arr.tolist())  # Convert to list for accumulation
 
             # Convert to COO matrix, then CSR for efficient row operations
             if rows_list:
@@ -595,45 +624,204 @@ class BeliefMDP_n_M_SLAM(BeliefMDP_n_SLAM, BaseBeliefMDP_n_M):
             nnz = csr_mat.nnz
             sparsity = (1.0 - nnz / (cardinality * cardinality)) * 100
             if show_progress:
-                print(f"  Action {k}: {nnz:,} non-zeros ({sparsity:.2f}% sparse)")
+                tqdm.write(f"  Action {k+1}/{n_u}: {nnz:,} non-zeros ({sparsity:.2f}% sparse)")
 
         return p_n_M_sparse
 
-    def c_n_M(self, π, u):
+    @property
+    def c_n_M(self) -> np.ndarray:
         """
-        Quantized cost function for belief-MDP_n_M.
+        Get the precomputed cost matrix.
 
-        c_n_M(π^M, u) = c_tilde_n(π^M, u)
-        where π^M is a quantized belief.
+        Returns:
+            Cost matrix of shape (cardinality, n_u) where c_n_M[i, k] = ρ_n(π_i^M, u_k)
+        """
+        if not hasattr(self, '_c_n_M_matrix') or self._c_n_M_matrix is None:
+            raise ValueError("c_n_M not precomputed. Ensure initialization completed successfully.")
+        return self._c_n_M_matrix
+
+    def get_cost(self, i: int, k: int) -> float:
+        """
+        Get cost for a specific belief-action pair.
+
+        c_n_M(π_i^M, u_k) = ρ_n(π_i^M, u_k) = c_effort(u_k) + r_exploration(π_i^M, u_k)
 
         Args:
-            π: Quantized belief (N_n,) - flattened belief vector
-            u: Action (2,)
+            i: Index of quantized belief in Π_n_M
+            k: Index of action in U_n
         Returns:
-            Cost value
+            Cost value (float)
         """
-        # Reshape the flattened belief vector to the expected 2D format
-        # π is (N_n,) where N_n = m_n + 2^(H*W)
-        # We need to split it into state and map components
-        m_n = self.SQ.size
-        H, W = self.map.occupancy_map.height, self.map.occupancy_map.width
-        len_M = 2**(H * W)
+        return float(self.c_n_M[i, k])
 
-        # Extract state and map components
-        π_states = π[:m_n]  # First m_n elements
-        π_maps = π[m_n:]    # Remaining elements
+    def _get_c_n_M_cache_path(self) -> Path:
+        """Generate cache file path for c_n_M based on quantization parameters."""
+        cache_dir = Path(__file__).parent.parent.parent / "cache/SLAM/cost_slam"
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Reshape to 2D format expected by c_tilde_n
-        π_2d = np.zeros((m_n, len_M))
-        for i in range(m_n):
-            for j in range(len_M):
-                # Map the flattened index to 2D coordinates
-                flat_idx = i * len_M + j
-                if flat_idx < len(π):
-                    π_2d[i, j] = π[flat_idx]
+        state_bounds_flat = self.state_bounds.flatten().tolist()
 
-        # Use the quantized cost from the parent class
-        return self.c_tilde_n(π_2d, u)
+        metadata = {
+            'M': self.M,
+            'n': self.n,
+            'state_bounds': state_bounds_flat,
+            'max_val': self.motion_model.max_v if hasattr(self.motion_model, 'max_v') else self.motion_model.max_a,
+            'dt': float(self.motion_model.dt),
+            'map_shape': (self.map_H, self.map_W),
+            'sigma_w': float(self.σ_w),
+            'sigma_v': float(self.σ_v),
+            'model': self.motion_model.__class__.__name__,
+            'state_dim': self.state_dim,
+            'cardinality': self.BQ.cardinality,
+            'N_n': self.N_n,
+            'm_n': self.SQ.m_n,
+            'n_u': self.AQ.n_u,
+            'exploration_type': self.exploration_type,
+            'kernel_version': 'v1-dense-float32',
+            'problem_type': 'slam',
+        }
+
+        metadata_str = str(sorted(metadata.items()))
+        metadata_hash = hashlib.md5(metadata_str.encode()).hexdigest()[:8]
+
+        max_val = self.motion_model.max_v if hasattr(self.motion_model, 'max_v') else self.motion_model.max_a
+        filename = f"cost_slam_M{self.M}_n{self.n}_map{self.map_H}x{self.map_W}_max{max_val}_{metadata_hash}.npz"
+
+        return cache_dir / filename
+
+    def _compute_c_n_M(self, show_progress: bool = True) -> np.ndarray:
+        """
+        Precompute costs for all belief-action combinations using batched ρ_n.
+
+        Returns:
+            c_n_M: Array of shape (cardinality, n_u) where c_n_M[i, k] = ρ_n(π_i^M, u_k)
+        """
+        cardinality = self.BQ.cardinality
+        n_u = self.AQ.n_u
+        Π_n_M = self.BQ.Π_n_M  # (cardinality, N_n)
+        U_n = self.AQ.U  # (n_u, 2)
+
+        if show_progress:
+            print(f"  Computing costs for {cardinality:,} beliefs × {n_u} actions...")
+
+        # Convert flattened beliefs to 2D format for ρ_n
+        # Π_n_M: (cardinality, N_n) where N_n = m_n * len_M
+        # Need to reshape to (cardinality, m_n, len_M)
+        Π_n_M_2d = np.array([self.unflatten_belief(π_flat) for π_flat in Π_n_M])  # (cardinality, m_n, len_M)
+
+        # Use batched ρ_n to compute all costs at once
+        # ρ_n expects (n_π, m_n, len_M) and (n_u, 2), returns (n_π, n_u)
+        c_n_M = self.ρ_n(Π_n_M_2d, U_n)  # (cardinality, n_u)
+
+        return c_n_M
+
+    def _save_c_n_M(self, cache_path: Path, c_n_M: np.ndarray) -> None:
+        """Save c_n_M to cache file with metadata."""
+        state_bounds = self.state_bounds.astype(float)
+        state_bounds_save = state_bounds.get() if hasattr(state_bounds, 'get') else state_bounds
+
+        metadata = {
+            'M': self.M,
+            'n': self.n,
+            'state_bounds': state_bounds_save,
+            'max_val': self.motion_model.max_v if hasattr(self.motion_model, 'max_v') else self.motion_model.max_a,
+            'dt': float(self.motion_model.dt),
+            'map_shape': _numpy.array([self.map_H, self.map_W]),
+            'sigma_w': float(self.σ_w),
+            'sigma_v': float(self.σ_v),
+            'm_n': self.SQ.m_n,
+            'n_u': self.AQ.n_u,
+            'cardinality': self.BQ.cardinality,
+            'N_n': self.N_n,
+            'model': self.motion_model.__class__.__name__,
+            'state_dim': self.state_dim,
+            'exploration_type': self.exploration_type,
+            'kernel_version': 'v1-dense-float32',
+            'problem_type': 'slam',
+        }
+
+        # Convert to numpy if CuPy array
+        if hasattr(c_n_M, 'get'):
+            c_n_M_np = c_n_M.get()
+        else:
+            c_n_M_np = c_n_M
+
+        save_dict = metadata.copy()
+        save_dict['c_n_M'] = c_n_M_np.astype(_numpy.float32)
+
+        _numpy.savez_compressed(cache_path, **save_dict)
+
+    def _load_c_n_M(self, cache_path: Path) -> bool:
+        """Load c_n_M from cache file if it exists and matches current parameters."""
+        if not cache_path.exists():
+            print(f"  Cache file does not exist: {cache_path}")
+            return False
+
+        print(f"  Checking cache file: {cache_path.name}")
+        try:
+            data = _numpy.load(str(cache_path))
+            state_bounds_np = self.state_bounds.astype(float)
+            state_bounds_np = state_bounds_np.get() if hasattr(state_bounds_np, 'get') else state_bounds_np
+
+            max_val = self.motion_model.max_v if hasattr(self.motion_model, 'max_v') else self.motion_model.max_a
+            expected_metadata = {
+                'M': self.M,
+                'n': self.n,
+                'state_bounds': state_bounds_np,
+                'max_val': max_val,
+                'dt': float(self.motion_model.dt),
+                'map_shape': _numpy.array([self.map_H, self.map_W]),
+                'sigma_w': float(self.σ_w),
+                'sigma_v': float(self.σ_v),
+                'm_n': self.SQ.m_n,
+                'n_u': self.AQ.n_u,
+                'cardinality': self.BQ.cardinality,
+                'N_n': self.N_n,
+                'model': self.motion_model.__class__.__name__,
+                'state_dim': self.state_dim,
+                'exploration_type': self.exploration_type,
+                'kernel_version': 'v1-dense-float32',
+                'problem_type': 'slam',
+            }
+
+            for key, expected_value in expected_metadata.items():
+                if key not in data:
+                    print(f"  Cache mismatch: key '{key}' not found in cache")
+                    return False
+                data_value = data[key]
+                if isinstance(expected_value, _numpy.ndarray):
+                    if not _numpy.array_equal(data_value, expected_value):
+                        print(f"  Cache mismatch: '{key}' array values differ")
+                        return False
+                else:
+                    if isinstance(data_value, _numpy.ndarray):
+                        try:
+                            data_value = data_value.item()
+                        except ValueError:
+                            print(f"  Cache mismatch: '{key}' cannot be converted to scalar")
+                            return False
+                    if data_value != expected_value:
+                        print(f"  Cache mismatch: '{key}' values differ")
+                        print(f"    Expected: {expected_value} (type: {type(expected_value)})")
+                        print(f"    Cached: {data_value} (type: {type(data_value)})")
+                        return False
+
+            self._c_n_M_matrix = np.asarray(data['c_n_M'])
+            expected_shape = (self.BQ.cardinality, self.AQ.n_u)
+            if self._c_n_M_matrix.shape != expected_shape:
+                print(f"  Cache mismatch: c_n_M shape differs")
+                print(f"    Expected: {expected_shape}")
+                print(f"    Cached: {self._c_n_M_matrix.shape}")
+                return False
+
+            print(f"  ✓ Cache metadata matches, loading c_n_M")
+            return True
+
+        except Exception as e:
+            print(f"Error loading c_n_M cache: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
 
 class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
@@ -648,7 +836,7 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
         return self.SQ.m_n
 
     def __init__(self, M: int, β: float, n: int, motion_model: SingleIntegratorModel | DoubleIntegratorModel,
-                 measurement_model: LIDAR, obstacles: list[Obstacle], _map: LidarGridMapVec,
+                 measurement_model: LIDAR | RangeBearingSensor, obstacles: list[Obstacle], _map: BaseMap,
                  sigma_w: float = 0.01, sigma_v: float = 1.0):
         super().__init__(n, motion_model, measurement_model, obstacles, _map, sigma_w, sigma_v)
         self.M = M
@@ -698,148 +886,103 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
     def _load_c_n_M(self, cache_path: Path) -> bool:
         return self._load_dense_c_n_M(cache_path, 'v1-dense-float32', (self.BQ.cardinality, self.AQ.n_u))
 
-    def η_n(self, j: int, i: int, u: np.ndarray, n_samples: int = 24000, seed: int = None, batch_size: int = 24000, show_progress: bool = True) -> float:
+    def η_n(self, j: int, i: int, u: np.ndarray) -> float:
         """
         Overloaded η_n that takes belief indices instead of belief vectors.
 
-        Computes transition probability η_n(π_j^M | π_i^M, u) via Monte Carlo integration for localization.
-        Accesses beliefs directly from cached codebook self.BQ.Π_n_M, avoiding unnecessary
-        copying of large belief vectors.
-
-        η_n(π_j^M | π_i^M, u) = ∫ 𝟙_{F(π_i^M,u,y) ≈ π_j^M} H(dy | π_i^M, u)
+        Now delegates to the finite-observation η_n implementation in BeliefMDP_n_Localization,
+        using quantized beliefs from the codebook Π_n_M.
 
         Args:
-            j: Index of target belief in Π_n_M (i.e., π_j^M = self.BQ.Π_n_M[j])
-            i: Index of current belief in Π_n_M (i.e., π_i^M = self.BQ.Π_n_M[i])
+            j: Index of target belief in Π_n_M (π_j^M)
+            i: Index of current belief in Π_n_M (π_i^M)
             u: Action (2,)
-            n_samples: Number of Monte Carlo samples (default: 24000)
-            seed: Random seed for reproducibility
-            batch_size: Batch size for GPU-accelerated sampling (default: 24000, processes all samples at once)
-            show_progress: Whether to show progress bar (default: True)
         Returns:
             float: Probability of transitioning from π_i^M to π_j^M under action u
         """
-        if seed is not None:
-            random.seed(seed)
+        # Access beliefs directly from cached codebook
+        π_new_1d = self.BQ.Π_n_M[j]  # (m_n,)
+        π_1d = self.BQ.Π_n_M[i]      # (m_n,)
 
-        # Access beliefs directly from cached codebook (no copying)
-        π_new_flat = self.BQ.Π_n_M[j]  # Target belief (m_n,)
-        π_flat = self.BQ.Π_n_M[i]      # Current belief (m_n,)
+        # Delegate to parent (finite-sum) implementation
+        return super().η_n(π_new_1d, π_1d, u)
 
-        # For localization, beliefs are already 1D (no unflatten needed)
-        π_new_1d = π_new_flat
-        π_1d = π_flat
-
-        count = 0
-        n_batches = (n_samples + batch_size - 1) // batch_size
-
-        batch_iter = tqdm(range(n_batches), desc=f"η_n MC sampling (n={n_samples}, batch={batch_size})",
-                          unit="batch", disable=not show_progress) if show_progress else range(n_batches)
-        for batch_idx in batch_iter:
-            current_batch_size = min(batch_size, n_samples - batch_idx * batch_size)
-
-            # Batch sample observations
-            Y_batch = self.sample_observations_batch(π_1d, u, current_batch_size)  # (current_batch_size, B)
-
-            # Batch update beliefs using F_batch_log
-            π_sampled_batch = self.F_batch_log(π_1d, u, Y_batch)  # (current_batch_size, m_n)
-
-            # Compute L2 distances for all beliefs in batch
-            π_new_broadcast = np.broadcast_to(π_new_1d[np.newaxis, :], (current_batch_size, len(π_new_1d)))
-            distances = np.linalg.norm(π_sampled_batch - π_new_broadcast, axis=1)  # (current_batch_size,)
-
-            # Count matches
-            count += int(np.sum(distances.get() < 1e-3) if hasattr(distances, 'get') else np.sum(distances < 1e-3))
-
-        return count / n_samples
-
-    def η_n_batch(self, j_list: list[int], i: int, u: np.ndarray, n_samples: int = 24000, seed: int = None,
-                  mc_batch_size: int = 24000, show_progress: bool = True) -> np.ndarray:
+    def η_n_batch(self, j_list: list[int], i: int, u: np.ndarray) -> np.ndarray:
         """
-        Batched version of η_n that processes multiple target beliefs in parallel for localization.
+        Fully vectorized batched version of η_n over multiple target belief indices for localization.
+
+        Computes probabilities for all target beliefs simultaneously by:
+        1. Computing H_y and π_all_batch (all updated beliefs for all observations) once
+        2. Vectorized distance computation between all target beliefs and all updated beliefs
+        3. Summing H_y for matching observations for each target belief
 
         Args:
             j_list: List of target belief indices in Π_n_M
             i: Index of current belief in Π_n_M
             u: Action (2,)
-            n_samples: Number of Monte Carlo samples (default: 24000)
-            seed: Random seed for reproducibility
-            mc_batch_size: Batch size for Monte Carlo sampling (default: 24000)
-            show_progress: Whether to show progress bar (default: True)
         Returns:
             np.ndarray: Array of probabilities, shape (len(j_list),)
         """
-        if seed is not None:
-            random.seed(seed)
-
         if len(j_list) == 0:
             return np.array([])
 
         # Access current belief from codebook
-        π_flat = self.BQ.Π_n_M[i]  # Current belief (m_n,)
-        π_1d = π_flat
+        π_1d = self.BQ.Π_n_M[i]  # (m_n,)
+
+        # For localization, we need to compute H_y and π_all_batch manually
+        # (Localization doesn't have _compute_H_y_and_F, but we can replicate the logic)
+        if self.Q_n is None:
+            raise ValueError("Q_n must be precomputed. Ensure observation quantization is configured.")
+
+        # 1) Predicted belief over poses using T_mat
+        Tn_mat = self.T_mat[:, :, self.AQ.get_quantized_index(u)]  # (m_n, m_n)
+        predicted = Tn_mat @ π_1d  # (m_n,)
+        log_predicted = np.log(np.maximum(predicted, 1e-300))
+
+        # 2) Compute H for ALL observations at once: H_y = sum(Q_n * predicted) over poses
+        m_y = int(self.Y_n.shape[0])
+        # Q_n shape: (m_y, m_n), predicted shape: (m_n,)
+        from scipy.special import logsumexp
+        if is_cupy:
+            from cupyx.scipy.special import logsumexp
+        log_Q_n = np.log(np.maximum(self.Q_n, 1e-300))  # (m_y, m_n)
+        log_numerator = log_Q_n + log_predicted[np.newaxis, :]  # (m_y, m_n)
+
+        # H_y = sum(Q_n * predicted) over poses - compute in log space for stability
+        log_H_y = logsumexp(log_numerator, axis=1)  # (m_y,)
+        H_y = np.exp(log_H_y)  # (m_y,)
+
+        # Normalize H_y
+        total_H = np.sum(H_y)
+        if total_H > 0:
+            H_y = H_y / total_H
+
+        # 3) Compute F for ALL observations directly from Q_n and predicted
+        log_F = log_numerator - log_H_y[:, np.newaxis]  # (m_y, m_n)
+        π_all_batch = np.exp(log_F)  # (m_y, m_n)
 
         # Access all target beliefs from codebook
         n_targets = len(j_list)
-        π_targets_list = []
-        for j in j_list:
-            π_flat = self.BQ.Π_n_M[j]
-            if hasattr(π_flat, 'get'):
-                π_targets_list.append(π_flat)
-            else:
-                π_targets_list.append(np.asarray(π_flat))
-        π_targets_1d = np.stack(π_targets_list)  # (n_targets, m_n)
+        π_targets_1d = np.array([self.BQ.Π_n_M[j] for j in j_list])  # (n_targets, m_n)
 
-        # Initialize counts for each target
-        counts = np.zeros(n_targets, dtype=np.int32)
+        # Vectorized distance computation:
+        # π_all_batch: (m_y, m_n)
+        # π_targets_1d: (n_targets, m_n)
+        # Compute pairwise distances: (n_targets, m_y)
+        π_diff = π_targets_1d[:, np.newaxis, :] - π_all_batch[np.newaxis, :, :]  # (n_targets, m_y, m_n)
+        distances = np.linalg.norm(π_diff, axis=2)  # (n_targets, m_y)
 
-        # Process Monte Carlo samples in batches
-        n_mc_batches = (n_samples + mc_batch_size - 1) // mc_batch_size
-        batch_iter = tqdm(range(n_mc_batches), desc=f"η_n_batch (n={n_samples}, targets={n_targets}, mc_batch={mc_batch_size})",
-                          unit="batch", disable=not show_progress) if show_progress else range(n_mc_batches)
+        # Vectorized matching: mask observations where distance < threshold for each target
+        threshold = 1e-3
+        matches = (distances < threshold) & (H_y[np.newaxis, :] > 0.0)  # (n_targets, m_y)
 
-        for batch_idx in batch_iter:
-            current_mc_batch_size = min(mc_batch_size, n_samples - batch_idx * mc_batch_size)
+        # Sum H_y for matching observations for each target belief
+        H_y_broadcast = H_y[np.newaxis, :]  # (1, m_y)
+        probs = np.sum(H_y_broadcast * matches, axis=1)  # (n_targets,)
 
-            # Batch sample observations (shared across all j targets)
-            Y_batch = self.sample_observations_batch(π_1d, u, current_mc_batch_size)  # (current_mc_batch_size, B)
+        return probs.astype(np.float32)
 
-            # Batch update beliefs using F_batch_log (computed once, shared across all j)
-            π_sampled_batch = self.F_batch_log(π_1d, u, Y_batch)  # (current_mc_batch_size, m_n)
-
-            # Compute distances to all target beliefs simultaneously
-            π_sampled_expanded = π_sampled_batch[:, np.newaxis, :]  # (current_mc_batch_size, 1, m_n)
-            π_targets_expanded = π_targets_1d[np.newaxis, :, :]  # (1, n_targets, m_n)
-
-            # Compute L2 distances: (current_mc_batch_size, n_targets)
-            distances = np.linalg.norm(π_sampled_expanded - π_targets_expanded, axis=2)
-
-            # Count matches for each target
-            matches = distances < 1e-3  # (current_mc_batch_size, n_targets)
-
-            # Sum matches directly (works with both NumPy and CuPy)
-            batch_counts = np.sum(matches, axis=0)  # (n_targets,)
-
-            # Ensure batch_counts matches the backend of counts
-            # If counts is CuPy and batch_counts is NumPy (or vice versa), convert
-            if hasattr(counts, 'get') and not hasattr(batch_counts, 'get'):
-                # counts is CuPy, batch_counts is NumPy - convert batch_counts to CuPy
-                batch_counts = np.asarray(batch_counts, dtype=np.int32)
-            elif not hasattr(counts, 'get') and hasattr(batch_counts, 'get'):
-                # counts is NumPy, batch_counts is CuPy - convert batch_counts to NumPy
-                batch_counts = batch_counts.get().astype(np.int32)
-            else:
-                # Same backend - just ensure dtype
-                batch_counts = batch_counts.astype(np.int32)
-
-            counts += batch_counts
-
-        counts_array = np.array(counts, dtype=np.float32)
-        probabilities = counts_array / n_samples
-
-        return probabilities
-
-    def _compute_p_n_M(self, n_samples: int = 24000, batch_size: int = 24000, j_batch_size: int = 100,
+    def _compute_p_n_M(self, j_batch_size: int = 100,
                        show_progress: bool = True, threshold: float = 1e-8) -> list:
         """Compute the full transition probability matrix p_n^{(M)} over all belief-action pairs for localization."""
         cardinality = self.BQ.cardinality
@@ -850,8 +993,8 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
         for k in range(n_u):
             u = self.AQ.U[k]
             if show_progress:
-                print(f"Computing p_n_M for action {k+1}/{n_u}...")
-                print(f"  This will compute transitions for {cardinality:,} belief states")
+                tqdm.write(f"Computing p_n_M for action {k+1}/{n_u}...")
+                tqdm.write(f"  This will compute transitions for {cardinality:,} belief states")
 
             rows_list = []
             cols_list = []
@@ -859,10 +1002,17 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
 
             test_mode = False
             if test_mode:
-                print("  TEST MODE: Only processing first belief state")
+                tqdm.write("  TEST MODE: Only processing first belief state")
                 cardinality = 1
 
-            for i in range(cardinality):
+            # Progress bar for beliefs (outer loop)
+            pbar = tqdm(range(cardinality),
+                        desc=f"Action {k+1}/{n_u}",
+                        disable=not show_progress,
+                        leave=True,
+                        mininterval=0.5)
+
+            for i in pbar:
                 row_data = []
                 row_cols = []
 
@@ -873,19 +1023,12 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
                 j_indices = list(range(cardinality))
                 n_j_batches = (cardinality + j_batch_size - 1) // j_batch_size
 
-                pbar = tqdm(range(n_j_batches),
-                            desc=f"Action {k+1}/{n_u}, Belief {i+1}/{cardinality}",
-                            disable=not show_progress,
-                            leave=False,
-                            mininterval=0.5)
-
-                for j_batch_idx in pbar:
+                for j_batch_idx in range(n_j_batches):
                     start_j = j_batch_idx * j_batch_size
                     end_j = min(start_j + j_batch_size, cardinality)
                     j_batch = j_indices[start_j:end_j]
 
-                    probs = self.η_n_batch(j_batch, i, u, n_samples=n_samples,
-                                           mc_batch_size=batch_size, show_progress=False)
+                    probs = self.η_n_batch(j_batch, i, u)
 
                     if hasattr(probs, 'get'):
                         probs_cpu = probs.get()
@@ -897,8 +1040,9 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
                             row_data.append(float(prob))
                             row_cols.append(j_idx)
 
-                    if show_progress:
-                        pbar.set_postfix({'nonzeros': len(row_data), 'j_batch': f'{start_j}-{end_j-1}'})
+                # Update progress bar with current belief's statistics
+                if show_progress:
+                    pbar.set_postfix({'nonzeros': len(row_data)})
 
                 if is_cupy:
                     import cupy as cp
@@ -908,9 +1052,6 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
                     import cupy as cp
                     cp.get_default_memory_pool().free_all_blocks()
                     cp.get_default_pinned_memory_pool().free_all_blocks()
-
-                if show_progress:
-                    print(f"  Belief {i+1}/{cardinality}: {len(row_data)} non-zero transitions")
 
                 if row_data:
                     row_data_arr = np.array(row_data, dtype=np.float32)
@@ -941,7 +1082,7 @@ class BeliefMDP_n_M_Localization(BeliefMDP_n_Localization, BaseBeliefMDP_n_M):
             nnz = csr_mat.nnz
             sparsity = (1.0 - nnz / (cardinality * cardinality)) * 100
             if show_progress:
-                print(f"  Action {k}: {nnz:,} non-zeros ({sparsity:.2f}% sparse)")
+                tqdm.write(f"  Action {k+1}/{n_u}: {nnz:,} non-zeros ({sparsity:.2f}% sparse)")
 
         return p_n_M_sparse
 
@@ -1245,13 +1386,12 @@ class BeliefMDP_n_M_Mapping(BeliefMDP_n_Mapping, BaseBeliefMDP_n_M):
     def _load_c_n_M(self, cache_path: Path) -> bool:
         return self._load_dense_c_n_M(cache_path, 'v1-dense-float32', (self.BQ.cardinality, self.SQ.m_n, self.AQ.n_u))
 
-    def η_n(self, j: int, i: int, x_current: np.ndarray, u: np.ndarray, x_next: np.ndarray,
-            n_samples: int = 24000, seed: int = None, batch_size: int = 24000, show_progress: bool = True) -> float:
+    def η_n(self, j: int, i: int, x_current: np.ndarray, u: np.ndarray, x_next: np.ndarray) -> float:
         """
         Overloaded η_n that takes belief indices instead of belief vectors for mapping.
 
-        Computes joint transition probability η_n(π_j^M, x_next | π_i^M, x_current, u) via Monte Carlo integration.
-        Note: For mapping, this computes the joint probability of belief π_j^M and state x_next.
+        Now delegates to the finite-observation η_n implementation in BeliefMDP_n_Mapping,
+        using quantized beliefs from the codebook Π_n_M.
 
         Args:
             j: Index of target belief in Π_n_M (i.e., π_j^M = self.BQ.Π_n_M[j])
@@ -1259,16 +1399,9 @@ class BeliefMDP_n_M_Mapping(BeliefMDP_n_Mapping, BaseBeliefMDP_n_M):
             x_current: current state (state_dim,) - part of augmented state b_t = (x_t, π_t)
             u: Action (2,)
             x_next: next state (state_dim,) - given as input, not sampled
-            n_samples: Number of Monte Carlo samples (default: 24000)
-            seed: Random seed for reproducibility
-            batch_size: Batch size for GPU-accelerated sampling (default: 24000)
-            show_progress: Whether to show progress bar (default: True)
         Returns:
             float: Joint probability of (π_j^M, x_next) from augmented state (x_current, π_i^M) under action u
         """
-        if seed is not None:
-            random.seed(seed)
-
         # Access beliefs directly from cached codebook
         π_new_flat = self.BQ.Π_n_M[j]  # Target belief (len_M,)
         π_flat = self.BQ.Π_n_M[i]      # Current belief (len_M,)
@@ -1277,105 +1410,94 @@ class BeliefMDP_n_M_Mapping(BeliefMDP_n_Mapping, BaseBeliefMDP_n_M):
         π_new_1d = π_new_flat
         π_1d = π_flat
 
-        # Call parent's η_n method with belief vectors
-        return super().η_n(π_new_1d, π_1d, x_current, u, x_next, n_samples=n_samples,
-                           seed=seed, batch_size=batch_size, show_progress=show_progress)
+        # Delegate to parent (finite-sum) implementation
+        return super().η_n(π_new_1d, π_1d, x_current, u, x_next)
 
-    def η_n_batch(self, j_list: list[int], i: int, x_current: np.ndarray, u: np.ndarray, x_next: np.ndarray,
-                  n_samples: int = 24000, seed: int = None, mc_batch_size: int = 24000, show_progress: bool = True) -> np.ndarray:
+    def η_n_batch(self, j_list: list[int], i: int, x_current: np.ndarray, u: np.ndarray, x_next: np.ndarray) -> np.ndarray:
         """
-        Batched version of η_n that processes multiple target beliefs in parallel for mapping.
+        Fully vectorized batched version of η_n for mapping.
+
+        Computes joint probabilities η_n(π_j^M, x_next | π_i^M, x_current, u) for all target beliefs simultaneously
+        using discrete observation quantization.
 
         Args:
             j_list: List of target belief indices in Π_n_M
             i: Index of current belief in Π_n_M
-            x_current: current state (state_dim,)
+            x_current: current state (state_dim,) - part of augmented state b_t = (x_t, π_t)
             u: Action (2,)
-            x_next: next state (state_dim,)
-            n_samples: Number of Monte Carlo samples (default: 24000)
-            seed: Random seed for reproducibility
-            mc_batch_size: Batch size for Monte Carlo sampling (default: 24000)
-            show_progress: Whether to show progress bar (default: True)
+            x_next: next state (state_dim,) - given as input, not sampled
         Returns:
-            np.ndarray: Array of probabilities, shape (len(j_list),)
+            np.ndarray: Array of joint probabilities, shape (len(j_list),)
         """
-        if seed is not None:
-            random.seed(seed)
-
         if len(j_list) == 0:
             return np.array([])
 
+        if self.Q_n is None:
+            raise ValueError("Q_n must be precomputed. Ensure observation quantization is configured.")
+
         # Access current belief from codebook
-        π_flat = self.BQ.Π_n_M[i]  # Current belief (len_M,)
-        π_1d = π_flat
+        π_1d = self.BQ.Π_n_M[i]  # Current belief (len_M,)
 
-        # Access all target beliefs from codebook
-        n_targets = len(j_list)
-        π_targets_list = []
-        for j in j_list:
-            π_flat = self.BQ.Π_n_M[j]
-            if hasattr(π_flat, 'get'):
-                π_targets_list.append(π_flat)
-            else:
-                π_targets_list.append(np.asarray(π_flat))
-        π_targets_1d = np.stack(π_targets_list)  # (n_targets, len_M)
-
-        # Initialize counts for each target
-        counts = np.zeros(n_targets, dtype=np.int32)
-
-        # Process Monte Carlo samples in batches
-        n_mc_batches = (n_samples + mc_batch_size - 1) // mc_batch_size
-        batch_iter = tqdm(range(n_mc_batches), desc=f"η_n_batch (n={n_samples}, targets={n_targets}, mc_batch={mc_batch_size})",
-                          unit="batch", disable=not show_progress) if show_progress else range(n_mc_batches)
-
-        for batch_idx in batch_iter:
-            current_mc_batch_size = min(mc_batch_size, n_samples - batch_idx * mc_batch_size)
-
-            # Batch sample observations (shared across all j targets)
-            Y_batch = self.sample_observations_batch(π_1d, x_next, current_mc_batch_size)  # (current_mc_batch_size, B)
-
-            # Batch update beliefs using F_batch_log (computed once, shared across all j)
-            π_sampled_batch = self.F_batch_log(π_1d, x_next, Y_batch)  # (current_mc_batch_size, len_M)
-
-            # Compute distances to all target beliefs simultaneously
-            π_sampled_expanded = π_sampled_batch[:, np.newaxis, :]  # (current_mc_batch_size, 1, len_M)
-            π_targets_expanded = π_targets_1d[np.newaxis, :, :]  # (1, n_targets, len_M)
-
-            # Compute L2 distances: (current_mc_batch_size, n_targets)
-            distances = np.linalg.norm(π_sampled_expanded - π_targets_expanded, axis=2)
-
-            # Count matches for each target
-            matches = distances < 1e-3  # (current_mc_batch_size, n_targets)
-
-            # Sum matches directly (works with both NumPy and CuPy)
-            batch_counts = np.sum(matches, axis=0)  # (n_targets,)
-
-            # Ensure batch_counts matches the backend of counts
-            # If counts is CuPy and batch_counts is NumPy (or vice versa), convert
-            if hasattr(counts, 'get') and not hasattr(batch_counts, 'get'):
-                # counts is CuPy, batch_counts is NumPy - convert batch_counts to CuPy
-                batch_counts = np.asarray(batch_counts, dtype=np.int32)
-            elif not hasattr(counts, 'get') and hasattr(batch_counts, 'get'):
-                # counts is NumPy, batch_counts is CuPy - convert batch_counts to NumPy
-                batch_counts = batch_counts.get().astype(np.int32)
-            else:
-                # Same backend - just ensure dtype
-                batch_counts = batch_counts.astype(np.int32)
-
-            counts += batch_counts
-
-        # Get transition probability T(x_next | x_current, u)
+        # Get quantized indices
         x_current_idx = self.SQ.get_quantized_index(x_current)
         x_next_idx = self.SQ.get_quantized_index(x_next)
         u_idx = self.AQ.get_quantized_index(u)
-        Tn_mat = self.T_mat[:, :, u_idx]
+
+        # Step 1: Get T(x_next | x_current, u) from T_mat
+        Tn_mat = self.T_mat[:, :, u_idx]  # (m_n, m_n)
         T_x_next_given_x_current_u = float(Tn_mat[x_next_idx, x_current_idx])
 
-        # Convert counts to probabilities and weight by transition probability
-        counts_array = np.array(counts, dtype=np.float32)
-        probabilities = (counts_array / n_samples) * T_x_next_given_x_current_u
+        # If transition probability is zero, return zeros
+        if T_x_next_given_x_current_u < 1e-300:
+            return np.zeros(len(j_list), dtype=np.float32)
 
-        return probabilities
+        # Step 2: Compute H for ALL observations at once: H_y = sum(Q_slice * π) over maps
+        m_y = int(self.Y_n.shape[0])
+        # Q_n shape: (m_y, m_n, len_M), slice for x_next: (m_y, len_M)
+        Q_slice = self.Q_n[:, x_next_idx, :]  # (m_y, len_M)
+        from scipy.special import logsumexp
+        if is_cupy:
+            from cupyx.scipy.special import logsumexp
+        log_Q_slice = np.log(np.maximum(Q_slice, 1e-300))  # (m_y, len_M)
+        log_π = np.log(np.maximum(π_1d, 1e-300))  # (len_M,)
+        log_numerator = log_Q_slice + log_π[np.newaxis, :]  # (m_y, len_M)
+
+        # H_y = sum(Q_slice * π) over maps - compute in log space for stability
+        log_H_y = logsumexp(log_numerator, axis=1)  # (m_y,)
+        H_y = np.exp(log_H_y)  # (m_y,)
+
+        # Normalize H_y
+        total_H = np.sum(H_y)
+        if total_H > 0:
+            H_y = H_y / total_H
+
+        # Step 3: Compute F for ALL observations directly from Q_slice and π
+        log_F = log_numerator - log_H_y[:, np.newaxis]  # (m_y, len_M)
+        π_all_batch = np.exp(log_F)  # (m_y, len_M)
+
+        # Access all target beliefs from codebook
+        n_targets = len(j_list)
+        π_targets_1d = np.array([self.BQ.Π_n_M[j] for j in j_list])  # (n_targets, len_M)
+
+        # Vectorized distance computation:
+        # π_all_batch: (m_y, len_M)
+        # π_targets_1d: (n_targets, len_M)
+        # Compute pairwise distances: (n_targets, m_y)
+        π_diff = π_targets_1d[:, np.newaxis, :] - π_all_batch[np.newaxis, :, :]  # (n_targets, m_y, len_M)
+        distances = np.linalg.norm(π_diff, axis=2)  # (n_targets, m_y)
+
+        # Vectorized matching: mask observations where distance < threshold for each target
+        threshold = 1e-3
+        matches = (distances < threshold) & (H_y[np.newaxis, :] > 0.0)  # (n_targets, m_y)
+
+        # Sum H_y for matching observations for each target belief
+        H_y_broadcast = H_y[np.newaxis, :]  # (1, m_y)
+        prob_belief = np.sum(H_y_broadcast * matches, axis=1)  # (n_targets,)
+
+        # Return joint probability = T(x_next | x_current, u) * P(π' ≈ π_j | x_next)
+        probabilities = prob_belief * T_x_next_given_x_current_u
+
+        return probabilities.astype(np.float32)
 
     def P_batch(self, j_list: list[int], i: int, x_next: np.ndarray,
                 n_samples: int = 24000, seed: int = None, mc_batch_size: int = 24000, show_progress: bool = True) -> np.ndarray:
@@ -1740,7 +1862,7 @@ class BeliefMDP_n_M_Mapping(BeliefMDP_n_Mapping, BaseBeliefMDP_n_M):
                 nnz = np.count_nonzero(p_n_M[:, :, :, :, k] > threshold)
                 total_elements = m_n * cardinality * m_n * cardinality
                 sparsity = (1.0 - nnz / total_elements) * 100
-                print(f"    Action {k}: {nnz:,} non-zeros ({sparsity:.2f}% sparse)")
+                tqdm.write(f"    Action {k+1}/{n_u}: {nnz:,} non-zeros ({sparsity:.2f}% sparse)")
 
         return p_n_M
 
