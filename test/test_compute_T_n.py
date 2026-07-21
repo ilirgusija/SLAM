@@ -11,7 +11,7 @@ from pathlib import Path
 from src.utils.map import load_obstacles_config
 from src.classes.mapping import LidarGridMapVec
 from src.classes.model import SingleIntegratorModel, LIDAR
-from src.classes.belief_mdp_n import BeliefMDP_n
+from src.belief_quantized.belief_mdp_n import BeliefMDP_n_SLAM as BeliefMDP_n
 
 
 @pytest.fixture

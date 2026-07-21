@@ -38,4 +38,4 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["algorithms", "classes", "utils", "script"]
+packages = ["classes", "utils", "script", "belief_quantized", "finite_memory"]

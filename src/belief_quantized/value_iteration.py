@@ -1,7 +1,7 @@
 import hashlib
 from pathlib import Path
 from ..utils.array_backend import np
-from ..classes.belief_mdp_n_M import BeliefMDP_n_M_Localization, BeliefMDP_n_M_Mapping
+from .belief_mdp_n_M import BeliefMDP_n_M_Localization, BeliefMDP_n_M_Mapping
 import numpy as _numpy  # For file I/O only
 
 
@@ -37,10 +37,18 @@ class ValueIteration():
         self.iteration_count = 0
         self.policy = None  # Will be computed after convergence
 
-    def run(self):
+    def run(self, verbose: bool = True):
         """
         Run value iteration algorithm using vectorized operations.
+
+        Args:
+            verbose: If True, print progress (iteration count, max |V - V_old|).
         """
+        self._verbose = getattr(self, '_verbose', verbose)
+        if self._verbose:
+            card = self.MDP_n.BQ.cardinality
+            n_u = self.MDP_n.AQ.n_u
+            print(f"  Value iteration: problem={self.problem_type}, |Π|={card}, n_u={n_u}, ε={self.epsilon}")
 
         if self.problem_type == 'localization':
             return self._run_localization()
@@ -51,13 +59,28 @@ class ValueIteration():
         """
         Vectorized value iteration for localization using sparse matrix operations.
 
-        V(π) = min_u [c(π, u) + β * Σ_{π'} p(π'|π, u) * V(π')]
+        V(π) = min_u [ρ_n(π, u) + β * Σ_{π'} p(π'|π, u) * V(π')]
+        where ρ_n(π, u) = r_exploration(π) + c_effort(u) (cost from MDP, stored in c_n_M).
 
-        Uses sparse matrix-vector multiplication for efficiency: p_n_M[k] @ V
+        Uses sparse matrix-vector multiplication: p_n_M[k] @ V.
         """
         c_n_M = self.MDP_n.c_n_M
         p_n_M = self.MDP_n.p_n_M
         n_u = self.MDP_n.AQ.n_u
+        verbose = getattr(self, '_verbose', True)
+
+        # Fail fast on bad cost/transition data (catch upstream bugs: beliefs, ρ_n, η_n)
+        if np.any(np.isnan(c_n_M)) or np.any(np.isinf(c_n_M)):
+            raise ValueError(
+                "c_n_M contains NaN or Inf (upstream bug). "
+                "Cost ρ_n = r_exploration + c_effort must be finite; check beliefs/codebook and delete c_n_M_localization cache if stale."
+            )
+        for k in range(n_u):
+            if np.any(np.isnan(p_n_M[k].data)) or np.any(np.isinf(p_n_M[k].data)):
+                raise ValueError(
+                    f"p_n_M[{k}] contains NaN or Inf (upstream bug). "
+                    "Transition η_n must be finite; check beliefs and delete p_n_M_localization cache if stale."
+                )
 
         q_values = None
         while self.is_not_converged():
@@ -73,57 +96,67 @@ class ValueIteration():
 
             self.V = np.min(q_values, axis=1)  # (cardinality,)
 
+            max_diff = float(np.max(np.abs(self.V - self.V_old)))
+            if verbose:
+                # Print every iteration for small problems; every 10th for larger
+                card = self.MDP_n.BQ.cardinality
+                if self.iteration_count <= 5 or self.iteration_count % 10 == 0 or max_diff < self.epsilon:
+                    print(f"    iter {self.iteration_count}: max |V - V_old| = {max_diff:.2e}")
+
         # Extract optimal policy after convergence
         self.policy = self._extract_policy_localization(c_n_M, p_n_M, q_values)
 
+        if verbose:
+            print(f"  Converged in {self.iteration_count} iterations (max_diff = {max_diff:.2e})")
         return self.V
 
     def _run_mapping(self):
         """
         Vectorized value iteration for mapping.
 
-        V(π, x) = min_u [c(π, x, u) + β * Σ_{x', π'} p(x', π'|x, π, u) * V(π', x')]
+        V(π, x) = min_u [ρ_n(π, x, u) + β * Σ_{x', π'} p(x', π'|x, π, u) * V(π', x')]
         """
         c_n_M = self.MDP_n.c_n_M
         p_n_M = self.MDP_n.p_n_M
+        verbose = getattr(self, '_verbose', True)
+        max_diff = float('inf')
+
+        cardinality = self.MDP_n.BQ.cardinality
+        m_n = self.MDP_n.SQ.m_n
+        n_u = self.MDP_n.AQ.n_u
+
         while self.is_not_converged():
             self.V_old = self.V.copy()
             self.iteration_count += 1
-            # Reshape p_n_M: (m_n, cardinality, m_n, cardinality, n_u)
-            # We want to sum over (x_next, π_next) for each (x_current, π_current, u)
-            # p_n_M[:, :, j, i, k] is (m_n, cardinality) - transitions from (x_j, π_i) under u_k
-
-            # p_n_M shape: (m_n, cardinality, m_n, cardinality, n_u) = (x_next, π_next, x_current, π_current, u)
-            # We need: Σ_{x_next, π_next} p(x_next, π_next | x_current, π_current, u) * V(π_next, x_next)
-
-            # V shape: (cardinality, m_n) = (π, x)
-            # We need V[π_next, x_next], so reshape V to align with p_n_M's (x_next, π_next) dimensions
-            # V.T is (m_n, cardinality) = (x, π), which matches (x_next, π_next) in p_n_M
-            V_T = self.V.T  # (m_n, cardinality) = (x_next, π_next)
-
-            # Reshape for broadcasting: (m_n, cardinality) -> (m_n, cardinality, 1, 1, 1)
-            V_for_sum = V_T[:, :, np.newaxis, np.newaxis, np.newaxis]  # (m_n, cardinality, 1, 1, 1)
-
-            # Broadcast multiply: p_n_M * V_for_sum
-            # p_n_M: (m_n, cardinality, m_n, cardinality, n_u) = (x_next, π_next, x_current, π_current, u)
-            # V_for_sum: (m_n, cardinality, 1, 1, 1) = (x_next, π_next, 1, 1, 1)
-            # Result: (m_n, cardinality, m_n, cardinality, n_u) where V values are aligned correctly
-            weighted_transitions = p_n_M * V_for_sum  # (m_n, cardinality, m_n, cardinality, n_u)
-
-            # Sum over (x_next, π_next) which are dimensions 0 and 1
-            # Result: (m_n, cardinality, n_u) = (x_current, π_current, u)
-            future_values = np.sum(weighted_transitions, axis=(0, 1))  # (m_n, cardinality, n_u)
-
-            # Transpose to match c_n_M shape: (cardinality, m_n, n_u) = (π_current, x_current, u)
-            future_values = np.transpose(future_values, (1, 0, 2))  # (cardinality, m_n, n_u)
-
-            q_values = c_n_M + self.MDP_n.β * future_values  # (cardinality, m_n, n_u)
-
+            # p_n_M is list of sparse (n_states, n_states), n_states = m_n*cardinality, state_idx = x*card + π
+            V_flat = self.V.T.reshape(-1)  # (m_n*cardinality,)
+            future_list = []
+            for k in range(n_u):
+                Ev = p_n_M[k] @ V_flat  # (n_states,)
+                future_list.append(Ev.reshape(m_n, cardinality).T)  # (cardinality, m_n)
+            future_values = np.stack(future_list, axis=2)  # (cardinality, m_n, n_u)
+            if c_n_M.ndim == 3:
+                # State-dependent mapping cost provided directly: (cardinality, m_n, n_u)
+                q_values = c_n_M + self.MDP_n.β * future_values
+            elif c_n_M.ndim == 2:
+                # State-independent mapping cost: (cardinality, n_u) -> broadcast over x
+                q_values = c_n_M[:, np.newaxis, :] + self.MDP_n.β * future_values
+            else:
+                raise ValueError(
+                    f"Invalid mapping c_n_M shape {c_n_M.shape}. "
+                    "Expected (cardinality, n_u) or (cardinality, m_n, n_u)."
+                )
             self.V = np.min(q_values, axis=2)  # (cardinality, m_n)
+
+            max_diff = float(np.max(np.abs(self.V - self.V_old)))
+            if verbose and (self.iteration_count <= 5 or self.iteration_count % 10 == 0 or max_diff < self.epsilon):
+                print(f"    iter {self.iteration_count}: max |V - V_old| = {max_diff:.2e}")
 
         # Extract optimal policy after convergence
         self.policy = self._extract_policy_mapping(c_n_M, p_n_M)
 
+        if verbose:
+            print(f"  Converged in {self.iteration_count} iterations (max_diff = {max_diff:.2e})")
         return self.V
 
     def is_not_converged(self):
@@ -158,16 +191,24 @@ class ValueIteration():
         Returns:
             policy: Array of shape (cardinality, m_n) with optimal action indices
         """
-        # Recompute Q-values
-        V_T = self.V.T  # (m_n, cardinality) = (x_next, π_next)
-        V_for_sum = V_T[:, :, np.newaxis, np.newaxis, np.newaxis]  # (m_n, cardinality, 1, 1, 1)
-
-        weighted_transitions = p_n_M * V_for_sum  # (m_n, cardinality, m_n, cardinality, n_u)
-        future_values = np.sum(weighted_transitions, axis=(0, 1))  # (m_n, cardinality, n_u)
-        future_values = np.transpose(future_values, (1, 0, 2))  # (cardinality, m_n, n_u)
-
-        q_values = c_n_M + self.MDP_n.β * future_values  # (cardinality, m_n, n_u)
-
+        cardinality = self.MDP_n.BQ.cardinality
+        m_n = self.MDP_n.SQ.m_n
+        n_u = self.MDP_n.AQ.n_u
+        V_flat = self.V.T.reshape(-1)
+        future_list = []
+        for k in range(n_u):
+            Ev = p_n_M[k] @ V_flat
+            future_list.append(Ev.reshape(m_n, cardinality).T)
+        future_values = np.stack(future_list, axis=2)  # (cardinality, m_n, n_u)
+        if c_n_M.ndim == 3:
+            q_values = c_n_M + self.MDP_n.β * future_values
+        elif c_n_M.ndim == 2:
+            q_values = c_n_M[:, np.newaxis, :] + self.MDP_n.β * future_values
+        else:
+            raise ValueError(
+                f"Invalid mapping c_n_M shape {c_n_M.shape}. "
+                "Expected (cardinality, n_u) or (cardinality, m_n, n_u)."
+            )
         return np.argmin(q_values, axis=2)  # (cardinality, m_n)
 
     def _get_metadata(self):
@@ -200,6 +241,7 @@ class ValueIteration():
 
         if self.problem_type == 'localization':
             metadata['N_n'] = mdp.SQ.m_n
+            metadata['exploration_type'] = getattr(mdp, 'exploration_type', 'information gain')
         else:  # mapping
             metadata['N_n'] = mdp.len_M
 

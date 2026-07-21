@@ -1,7 +1,8 @@
-# Mark 'src' as a package. No implicit re-exports.
+"""SLAM research package: shared core + two approximation forks."""
 
 from . import classes
 from . import utils
-from . import algorithms
+from . import belief_quantized
+from . import finite_memory
 
-__all__ = []  # populated by star imports above
+__all__ = ["classes", "utils", "belief_quantized", "finite_memory"]

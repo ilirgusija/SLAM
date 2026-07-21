@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 from itertools import combinations_with_replacement
 from math import comb
-from numba import njit
 import matplotlib.pyplot as plt
 import time
 from tqdm import tqdm
@@ -945,13 +944,18 @@ class BeliefQuantizer:
         self._codebook_key_dtype = dtype
         self._codebook_keys = codebook_int_np_contig.view(dtype).reshape(-1)
 
-    # no helper needed; compute combinatorics outside JIT and pass in
-    @njit(cache=True)
-    def _reznik_algorithm_jit(z, N_n, M):
-        # Preconditions (Numba supports assert but avoid f-strings)
+    @staticmethod
+    def reznik_algorithm(z: np.ndarray, N_n: int, M: int):
+        """
+        Reznik algorithm for belief space quantization.
+
+        Args:
+            z: Belief vector (N_n,)
+        Returns:
+            Quantized belief vector (N_n,)
+        """
         assert z.shape[0] == N_n
         assert M > 0
-        # Using absolute tolerance check for sum(z) == 1
         s = np.sum(z)
         assert np.abs(s - 1.0) <= 1e-10
 
@@ -997,20 +1001,8 @@ class BeliefQuantizer:
         result = k_i.astype(np.float64) / M
         # Normalize to ensure sum = 1 (no-op if arithmetic exact)
         result = result / np.sum(result)
-        return result
-
-    def reznik_algorithm(self, z: np.ndarray):
-        """
-        Reznik algorithm for belief space quantization (wrapper calling JIT kernel).
-
-        Args:
-            z: Belief vector (N_n,)
-        Returns:
-            Quantized belief vector (N_n,)
-        """
-        result = BeliefQuantizer._reznik_algorithm_jit(z, self.N_n, self.M)
         # Match codebook dtype to avoid tiny numerical mismatches in comparisons
-        return result.astype(self.Π_n_M.dtype, copy=False)
+        return result.astype(np.float64, copy=False)
 
     def _generate_codebook(self):
         """
@@ -1089,7 +1081,7 @@ class BeliefQuantizer:
         Returns:
             Quantized belief vector (N_n,)
         """
-        return self.reznik_algorithm(belief)
+        return self.reznik_algorithm(belief, self.N_n, self.M)
 
     # Codebook look up
     def is_in_codebook_distance(self, q: np.ndarray, atol: float = 1e-10):

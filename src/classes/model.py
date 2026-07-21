@@ -1,21 +1,10 @@
 # Use CuPy backend (drop-in replacement for NumPy)
 import warnings
 from typing import Optional, Tuple, List
-from .mapping import BaseMap, LidarGridMapVec, LandmarkMap
-from .obstacle import Obstacle
+from .mapping import BaseMap, LandmarkMap
 from ..utils.angle import rot_mat_2d
 from ..utils.array_backend import np
 import matplotlib.pyplot as plt
-# Use CuPy's ndimage if available and USE_CUPY is enabled, otherwise scipy's
-import os
-use_cupy = os.getenv("USE_CUPY", "true").lower() in ("true", "1", "yes")
-if use_cupy:
-    try:
-        from cupyx.scipy import ndimage
-    except ImportError:
-        from scipy import ndimage
-else:
-    from scipy import ndimage
 # Use CuPy backend (drop-in replacement for NumPy)
 
 
@@ -226,13 +215,18 @@ class RangeBearingSensor:
     """
 
     def __init__(self, r_max: float = 10.0, epsilon: float = 0.01,
-                 sigma_r: float = 0.1, sigma_phi: float = 0.05):
+                 sigma_r: float = 0.1, sigma_phi: float = 0.05,
+                 r0: float | None = None, r1: float | None = None):
         """
         Args:
             r_max: Maximum sensing range
             epsilon: Minimum sensing range (must be > 0 to avoid atan2 singularity)
             sigma_r: Standard deviation of range noise
             sigma_phi: Standard deviation of bearing noise
+            r0: Inner transition radius for detection probability.
+                Must satisfy epsilon < r0 < r1 < r_max.
+            r1: Outer transition radius for detection probability.
+                Must satisfy epsilon < r0 < r1 < r_max.
         """
         if epsilon <= 0:
             raise ValueError("epsilon must be > 0 to avoid atan2 singularity")
@@ -243,7 +237,43 @@ class RangeBearingSensor:
         self.epsilon = epsilon
         self.sigma_r = sigma_r
         self.sigma_phi = sigma_phi
+        if r0 is None:
+            r0 = epsilon + 0.2 * (r_max - epsilon)
+        if r1 is None:
+            r1 = epsilon + 0.8 * (r_max - epsilon)
+        if not (epsilon < r0 < r1 < r_max):
+            raise ValueError("RangeBearingSensor requires epsilon < r0 < r1 < r_max")
+        self.r0 = float(r0)
+        self.r1 = float(r1)
         self.R = np.diag([sigma_r**2, sigma_phi**2])
+
+    @staticmethod
+    def _smoothstep01(z):
+        """Cubic smoothstep h(z)=3z^2-2z^3 on [0,1]."""
+        z = np.clip(z, 0.0, 1.0)
+        return 3.0 * z**2 - 2.0 * z**3
+
+    def _eta(self, r, a, b):
+        """Smooth transition η_{a,b}(r) from 0 to 1 on (a,b)."""
+        r = np.asarray(r, dtype=float)
+        out = np.zeros_like(r, dtype=float)
+        mid = (r > a) & (r < b)
+        if np.any(mid):
+            out[mid] = self._smoothstep01((r[mid] - a) / (b - a))
+        out = np.where(r >= b, 1.0, out)
+        return out
+
+    def detection_probability(self, r):
+        """
+        Continuous detection probability p_det(r).
+
+        p_det(r)=η_{epsilon,r0}(r) * (1-η_{r1,r_max}(r))
+        """
+        r = np.asarray(r, dtype=float)
+        eta_in = self._eta(r, self.epsilon, self.r0)
+        eta_out = self._eta(r, self.r1, self.r_max)
+        p_det = eta_in * (1.0 - eta_out)
+        return np.clip(p_det, 0.0, 1.0)
 
     def _project_bearing(self, phi):
         """
@@ -459,42 +489,44 @@ class RangeBearingSensor:
         if z_star.ndim == 2:
             z_star = z_star[np.newaxis, :, :]
 
-        visible = np.isfinite(z_star[..., 0])
+        ranges_raw, bearings_raw = self._compute_range_bearing(x, m)
+        if ranges_raw.ndim == 1:
+            ranges_raw = ranges_raw[np.newaxis, :]
+            bearings_raw = bearings_raw[np.newaxis, :]
 
+        p_det = self.detection_probability(ranges_raw)
+        detected = np.random.rand(*ranges_raw.shape) < p_det
+
+        z_noisy = np.full_like(z_star, np.nan, dtype=float)
         if v is None:
-            # Sample noise from μ_v
-            # For range: Gaussian N(0, σ_r²)
-            # For bearing: wrapped normal (sample from N(0, σ_φ²) then wrap)
+            if np.any(detected):
+                # Truncated Gaussian range sampling on [epsilon, r_max] via rejection.
+                mu = ranges_raw[detected]
+                sampled_r = mu + np.random.randn(*mu.shape) * self.sigma_r
+                invalid = (sampled_r < self.epsilon) | (sampled_r > self.r_max)
+                while np.any(invalid):
+                    sampled_r[invalid] = (
+                        mu[invalid] + np.random.randn(np.count_nonzero(invalid)) * self.sigma_r
+                    )
 
-            # Get noise-free ranges for noise sampling
-            ranges_raw, _ = self._compute_range_bearing(x, m)
-
-            # Sample range noise
-            v_r = np.random.randn(*ranges_raw.shape) * self.sigma_r
-
-            # Sample bearing noise: wrapped normal
-            v_phi = np.random.randn(*ranges_raw.shape) * self.sigma_phi
-
-            v = np.stack([v_r, v_phi], axis=-1)  # (N, M, 2)
+                sampled_phi = self._project_bearing(
+                    bearings_raw[detected] + np.random.randn(*mu.shape) * self.sigma_phi
+                )
+                z_noisy[..., 0][detected] = sampled_r
+                z_noisy[..., 1][detected] = sampled_phi
         else:
-            # Ensure v has correct shape to match z_star
+            # Deterministic noise injection (still respects stochastic miss-detection).
             v = np.asarray(v, dtype=float)
             if v.ndim == 2:
                 v = v[np.newaxis, :, :]
-            # Ensure v matches z_star shape
             if v.shape != z_star.shape:
                 raise ValueError(f"v shape {v.shape} does not match z_star shape {z_star.shape}")
-
-        # Add noise and apply bearing projection
-        z_noisy = z_star.copy()
-        z_noisy[visible] = z_star[visible] + v[visible]
-
-        # Apply bearing projection to ensure closure in [-π, π)
-        z_noisy[..., 1] = self._project_bearing(z_noisy[..., 1])
-
-        # Non-visible landmarks remain as [nan, nan]
-        z_noisy[~visible, 0] = np.nan
-        z_noisy[~visible, 1] = np.nan
+            z_noisy[..., 0][detected] = np.clip(
+                ranges_raw[detected] + v[..., 0][detected], self.epsilon, self.r_max
+            )
+            z_noisy[..., 1][detected] = self._project_bearing(
+                bearings_raw[detected] + v[..., 1][detected]
+            )
 
         if single_pose:
             return z_noisy[0]
@@ -878,18 +910,20 @@ class LIDAR:
         else:
             return np.full((S, N, self.B), np.inf), np.zeros((S, N, self.B), dtype=bool)
 
-    def g_bar(self, X, m, map_obj: BaseMap):
+    def g_bar(self, X, m, map_obj: BaseMap | None = None):
         """
         Deterministic observation model - ray casting to determine distances to obstacles.
 
-        Handles both single and batched maps by normalizing shapes.
+        Accepts either precomputed obstacle segments or occupancy grids.
 
         Args:
-            X: Array of robot positions (m_n, 2)
-            m: Either:
-               - Single occupancy grid (H, W)
-               - Batched occupancy grids (len_M, H, W)
-            map_obj: Map object with occupancy_map attribute containing left_lower, right_upper
+            X: Array of robot positions (m_n, 2) or (2,)
+            m: One of:
+               - obstacle segments list: [(x1, y1, x2, y2), ...]
+               - tuple: (obstacle_segments, segment_map_indices) for batched maps
+               - single occupancy grid (H, W)
+               - batched occupancy grids (len_M, H, W)
+            map_obj: Map object (required if m is an occupancy grid)
 
         Returns:
             y_star: Array of distances
@@ -897,39 +931,67 @@ class LIDAR:
                - Batched maps: (m_n, len_M, B)
         """
         X = np.asarray(X)
-        m = np.asarray(m)
-
         single_pose = X.ndim == 1
         if single_pose:
             X = X[np.newaxis, :]
 
-        single_map = m.ndim == 2
-        if single_map:
-            m = m[np.newaxis, :, :]
+        # Precomputed segments (single or batched)
+        if isinstance(m, tuple) and len(m) == 2:
+            obstacle_segments, segment_map_indices = m
+            y_star = self.g_bar_from_segments(X, obstacle_segments, segment_map_indices)
+            return y_star[0] if single_pose else y_star
 
-        y_star = self.g_bar_batched(X, m, map_obj)
+        if isinstance(m, list) or isinstance(m, tuple):
+            if len(m) == 0 or (len(m) > 0 and isinstance(m[0], (tuple, list)) and len(m[0]) == 4):
+                y_star = self.g_bar_from_segments(X, m)
+                return y_star[0] if single_pose else y_star
 
-        if single_map:
-            y_star = y_star[:, 0, :]
-        return y_star[0] if single_pose else y_star
+        if map_obj is None:
+            raise ValueError("map_obj is required when m is an occupancy grid.")
 
-    def g_bar_localization(self, X, obstacle_segments):
+        m = np.asarray(m)
+        if m.ndim == 2:
+            segments = map_obj.get_obstacle_segments(m) if hasattr(map_obj, "get_obstacle_segments") else []
+            if not segments:
+                raise ValueError(
+                    "No obstacle segments available for this map. Use POMDP.get_obstacles_from_map to preprocess.")
+            y_star = self.g_bar_from_segments(X, segments)
+            return y_star[0] if single_pose else y_star
+
+        if m.ndim == 3:
+            if not hasattr(map_obj, "get_obstacle_segments_batched"):
+                raise ValueError(
+                    "Map does not support batched obstacle segments. Use POMDP.get_obstacles_from_map_batched.")
+            segments_list = map_obj.get_obstacle_segments_batched(m)
+            all_segments = []
+            segment_map_indices = []
+            for map_idx, segments in enumerate(segments_list):
+                all_segments.extend(segments)
+                segment_map_indices.extend([map_idx] * len(segments))
+            y_star = self.g_bar_from_segments(X, all_segments, np.array(segment_map_indices, dtype=np.int32))
+            return y_star[0] if single_pose else y_star
+
+        raise ValueError(f"Unsupported map format for g_bar: shape={getattr(m, 'shape', None)}")
+
+    def g_bar_from_segments(self, X, obstacle_segments, segment_map_indices=None):
         """
-        Deterministic observation model for localization - ray casting using pre-computed obstacle segments.
-
-        For localization, the map is known and obstacle segments are pre-computed.
-        This avoids recomputing obstacle segments from the map on every call.
+        Deterministic observation model using pre-computed obstacle segments.
 
         Args:
             X: Array of robot positions (m_n, 2)
-            obstacle_segments: Pre-computed list of obstacle segments from the known map
+            obstacle_segments: List of obstacle segments
+            segment_map_indices: Optional map index for each segment (batched case)
 
         Returns:
-            y_star: Array of distances (m_n, B)
+            y_star: Array of distances
+               - Single map: (m_n, B)
+               - Batched maps: (m_n, len_M, B)
         """
         X = X[np.newaxis, :] if X.ndim == 1 else X
-        y_star = self.get_laser_ref(obstacle_segments, X)
-        return y_star if y_star.ndim == 2 else y_star[np.newaxis, :]
+        if segment_map_indices is None:
+            y_star = self.get_laser_ref(obstacle_segments, X)
+            return y_star if y_star.ndim == 2 else y_star[np.newaxis, :]
+        return self.get_laser_ref_batched(obstacle_segments, segment_map_indices, X)
 
     def get_laser_ref_batched(self, segments_list, segment_map_indices, robot_poses):
         """
@@ -1024,45 +1086,6 @@ class LIDAR:
 
         return y_star_all_reordered
 
-    def g_bar_batched(self, X, M, map_obj: BaseMap):
-        """
-        Batched deterministic observation model - ray casting for multiple maps simultaneously.
-
-        Processes all maps using vectorized operations. Uses list comprehension for
-        obstacle extraction (necessary due to connected components algorithm), but all
-        ray casting operations are fully vectorized on GPU.
-
-        Args:
-            X: Array of robot positions (m_n, 2)
-            M: Array of occupancy grids (len_M, H, W)
-            map_obj: Map object with occupancy_map attribute
-
-        Returns:
-            y_star_all: Array of distances (m_n, len_M, B)
-        """
-        X = X[np.newaxis, :] if X.ndim == 1 else X
-        len_M = M.shape[0]
-
-        # Extract obstacles for all maps - list comprehension is necessary here
-        # because connected components labeling is inherently per-map
-        # But this keeps data on GPU (M[map_idx] is a slice, stays on GPU)
-        map_segments_list = [self.get_obstacles_from_map(M[map_idx], map_obj) for map_idx in range(len_M)]
-
-        # Flatten segments with map indices - use list operations but convert to GPU arrays
-        all_segments = []
-        segment_map_indices_list = []
-
-        # Build segment list and indices - this is necessary for grouping
-        for map_idx, segments in enumerate(map_segments_list):
-            all_segments.extend(segments)
-            segment_map_indices_list.extend([map_idx] * len(segments))
-
-        # Convert to GPU array for vectorized operations
-        segment_map_indices = np.array(
-            segment_map_indices_list) if segment_map_indices_list else np.array([], dtype=np.int32)
-
-        # Use batched laser reflection computation
-        return self.get_laser_ref_batched(all_segments, segment_map_indices, X)
 
     def g(self, X, m, v, map_obj: BaseMap):
         """
@@ -1081,177 +1104,3 @@ class LIDAR:
         y_ideal = self.g_bar(X, m, map_obj)
         y_noisy = y_ideal + v
         return y_noisy
-
-    def get_obstacles_from_map(self, m, map_obj: BaseMap):
-        """
-        Convert map to obstacle segments.
-
-        Args:
-            m: Map representation (shape depends on map type)
-            map_obj: Map object implementing BaseMap interface
-
-        Returns:
-            List of obstacle segments
-        """
-        # Try to use the map's get_obstacle_segments method first
-        if hasattr(map_obj, 'get_obstacle_segments'):
-            segments = map_obj.get_obstacle_segments(m)
-            if segments:
-                return segments
-
-        # Fallback: for occupancy grids, use connected components
-        if hasattr(map_obj, 'occupancy_map'):
-            # Find connected components of occupied cells
-            connected_components = self._find_connected_components(m)
-
-            all_obstacle_segments = []
-
-            # Create obstacles for each connected component
-            for component in connected_components:
-                if len(component) > 0:
-                    obstacle_segments = self._create_obstacle_from_component(
-                        component, m.shape, map_obj)
-                    all_obstacle_segments.extend(obstacle_segments)
-            return all_obstacle_segments
-
-        # If no method available, return empty list
-        return []
-
-    def _find_connected_components(self, m):
-        """
-        Find connected components of occupied cells (value = 1) in the occupancy grid.
-        Uses 4-connectivity (cells sharing a side are connected) with ndimage.label (CuPy required).
-
-        Args:
-            m: (H, W) array of occupancy grid
-
-        Returns:
-            List of connected components, where each component is a list of (i, j) coordinates
-
-        Raises:
-            RuntimeError: If CuPy operations fail. CuPy is required for this operation.
-        """
-        # Convert to array if needed, ensuring it's the correct backend type
-        import numpy as _numpy
-
-        # Check which ndimage module we're using by checking the module name
-        # cupyx.scipy.ndimage requires CuPy arrays, scipy.ndimage requires NumPy arrays
-        ndimage_module_name = getattr(ndimage, '__name__', '')
-        is_cupy_ndimage = 'cupyx' in ndimage_module_name
-
-        # Convert to appropriate array type
-        if is_cupy_ndimage:
-            # Using CuPy's ndimage - requires CuPy array
-            import cupy as _cupy
-            if isinstance(m, _numpy.ndarray):
-                # Explicitly convert NumPy array to CuPy array
-                m = _cupy.asarray(m)
-            elif not hasattr(m, 'device'):  # Not a CuPy array (check for 'device' attribute)
-                # Try conversion via backend np first
-                m = np.array(m)
-                # If still not CuPy (doesn't have 'device'), force explicit conversion
-                if not hasattr(m, 'device'):
-                    m = _cupy.asarray(_numpy.asarray(m))
-        else:
-            # Using scipy's ndimage - requires NumPy array
-            # Check if it's a CuPy array by trying to import cupy and check type
-            try:
-                import cupy as _cupy
-                if isinstance(m, _cupy.ndarray):
-                    m = m.get()
-                else:
-                    m = _numpy.asarray(m)
-            except ImportError:
-                # CuPy not available, so it must be NumPy
-                m = _numpy.asarray(m)
-
-        # Label connected components
-        # Returns (labeled_array, num_features)
-        result = ndimage.label(m)
-        if isinstance(result, tuple):
-            labeled, num_features = result
-        else:
-            # Fallback: if it returns just the array, compute num_features
-            labeled = result
-            num_features = int(labeled.max())
-
-        # Extract components
-        components = []
-        for label in range(1, num_features + 1):
-            component = np.argwhere(labeled == label)
-            # Convert to list of tuples (handles both CPU and GPU arrays)
-            if hasattr(component, 'get'):
-                component = component.get()
-            components.append([tuple(coord) for coord in component])
-
-        return components
-
-    def _create_obstacle_from_component(self, component, grid_shape, map_obj: LidarGridMapVec):
-        """
-        Create obstacle segments from a connected component of cells.
-
-        Args:
-            component: List of (i, j) coordinates representing connected cells
-            grid_shape: Shape of the grid (H, W)
-            map_obj: Map object with occupancy_map attribute
-
-        Returns:
-            List of line segments representing the obstacle boundary
-        """
-        if not component:
-            return []
-
-        # Use the actual resolution from the map object
-        H, W = grid_shape
-        left_lower = map_obj.occupancy_map.left_lower
-        right_upper = map_obj.occupancy_map.right_upper
-
-        cell_w = map_obj.occupancy_map.resolution
-        cell_h = map_obj.occupancy_map.resolution
-
-        # Calculate bounding box
-        i_coords = [cell[0] for cell in component]
-        j_coords = [cell[1] for cell in component]
-
-        min_i, max_i = min(i_coords), max(i_coords)
-        min_j, max_j = min(j_coords), max(j_coords)
-        # Calculate dimensions in number of cells
-        num_cells_i = max_i - min_i + 1
-        num_cells_j = max_j - min_j + 1
-
-        # Calculate physical dimensions
-        dx = num_cells_j * cell_w  # width (columns)
-        dy = num_cells_i * cell_h  # height (rows)
-
-        # Calculate centroid at cell centers (account for 0.5 offset)
-        # IMPORTANT: Array row 0 is the TOP of the map. World y increases upward from bottom.
-        # Convert row index i to world row by flipping: i_world = H - 1 - i
-        res_x = cell_w
-        res_y = cell_h
-
-        center_i = (min_i + max_i + 1) / 2.0
-        center_j = (min_j + max_j + 1) / 2.0
-
-        # Map (i,j) -> (x,y) using cell edge convention, flipping row index
-        i_world = H - center_i
-        j_world = center_j
-        centroid = left_lower + np.array([j_world * res_x,
-                                          i_world * res_y])
-
-        # Create obstacle and get its line segments
-        obstacle = Obstacle(centroid, dx=dx, dy=dy, angle=0)
-        return obstacle._Obstacle__get_points(centroid)  # tuple: (bottom, top, left, right)
-
-
-class LIDAR_with_Noise(LIDAR):
-    def __init__(self, fov, r_max, B, noise_std):
-        super().__init__(fov, r_max, B)
-        self.noise_std = noise_std
-
-    def get_laser_ref(self, segments, robot_pose=None):
-        if robot_pose is None:
-            robot_pose = np.array([0.0, 0.0])
-        angles, dist_theta = super().get_laser_ref(segments, robot_pose)
-        dist_theta += np.random.normal(0,
-                                       self.noise_std, size=dist_theta.shape)
-        return angles, dist_theta

@@ -1,5 +1,6 @@
 import math
 from collections import deque
+import numpy as _numpy
 import matplotlib.pyplot as plt
 from ..utils.array_backend import np
 
@@ -41,8 +42,9 @@ class BaseMap(ABC):
         self.x_max = x_max
         self.y_min = y_min
         self.y_max = y_max
-        self.left_lower = np.array([x_min, y_min])
-        self.right_upper = np.array([x_max, y_max])
+        # Use host NumPy for tiny bounds so map construction never touches GPU (avoids CUDARuntimeError when context is bad)
+        self.left_lower = _numpy.array([x_min, y_min], dtype=_numpy.float64)
+        self.right_upper = _numpy.array([x_max, y_max], dtype=_numpy.float64)
 
     @property
     @abstractmethod
@@ -185,10 +187,15 @@ class BaseMap(ABC):
 
 class LandmarkMap(BaseMap):
     """
-    Landmark-based map representation.
+    Landmark-based map representation with spatial quantization.
 
-    Maps are represented as sets of landmarks, where each landmark is a point (x, y).
-    The map space consists of all possible combinations of landmarks from a discrete set.
+    Map space M = W^l where:
+    - W = workspace grid: n×n cell centres over [x_min,x_max]×[y_min,y_max]
+    - l = number of landmarks (L)
+    So |M| = (n²)^l. Each map is an (L, 2) array of landmark positions (cell centres).
+
+    For workspace [0,10]×[0,10] and n=2: W = {(2.5,2.5), (2.5,7.5), (7.5,2.5), (7.5,7.5)}.
+    For n=2, l=2: |M| = 4^2 = 16.
     """
 
     def __init__(
@@ -197,185 +204,172 @@ class LandmarkMap(BaseMap):
         x_max: float,
         y_min: float,
         y_max: float,
-        landmark_positions: np.ndarray,
-        max_landmarks: Optional[int] = None
+        n: int = 2,
+        *,
+        num_landmarks: int | None = None,
+        landmark_positions: np.ndarray | None = None,
     ):
         """
-        Initialize landmark map.
-
         Args:
-            x_min, x_max, y_min, y_max: Bounds of the map
-            landmark_positions: Array of shape (num_candidate_landmarks, 2) with candidate landmark positions
-            max_landmarks: Maximum number of landmarks in a map. If None, uses num_candidate_landmarks
+            x_min, x_max, y_min, y_max: Workspace bounds. W is the n×n grid over this box.
+            n: Quantization level. W has K = n² cell centres.
+            num_landmarks: Number of landmarks (l). Use this for coherent M=W^l; then
+                landmark_positions is set to the first l grid centres (for compat).
+            landmark_positions: Optional (L, 2) array. If provided, L = shape[0] and
+                overrides num_landmarks. Kept for backward compat; map space is still
+                built from the grid (cell_centers), not these values.
         """
         super().__init__(x_min, x_max, y_min, y_max)
-        self.landmark_positions = np.asarray(landmark_positions)  # (N, 2)
-        self.num_candidate_landmarks = self.landmark_positions.shape[0]
-        self.max_landmarks = max_landmarks if max_landmarks is not None else self.num_candidate_landmarks
+        self.n = int(n)
+        self.n_cells = self.n * self.n  # K = n²
 
-        # Map space: all subsets of landmarks (2^N possible maps)
-        # Each map is represented as a binary vector indicating which landmarks are present
-        self._len_M = 2 ** self.num_candidate_landmarks
+        # Build W = K cell centres in row-major order (row = y-axis, col = x-axis).
+        # Cell (i, j): centre_x = x_min + (j+0.5)*dx, centre_y = y_min + (i+0.5)*dy
+        dx = (x_max - x_min) / self.n
+        dy = (y_max - y_min) / self.n
+        self.cell_centers = np.array(
+            [[x_min + (j + 0.5) * dx, y_min + (i + 0.5) * dy]
+             for i in range(self.n) for j in range(self.n)],
+            dtype=np.float64,
+        )  # (K, 2) = workspace grid W
+
+        if landmark_positions is not None:
+            self.landmark_positions = np.asarray(landmark_positions, dtype=_numpy.float64)  # (L, 2)
+            self.num_candidate_landmarks = self.landmark_positions.shape[0]  # L (number of landmarks)
+        elif num_landmarks is not None:
+            self.num_candidate_landmarks = int(num_landmarks)  # L
+            # Nominal positions for compat: first L grid centres (cycle if L > K)
+            idx = np.arange(self.num_candidate_landmarks, dtype=np.intp) % self.n_cells
+            self.landmark_positions = np.asarray(self.cell_centers[idx], dtype=np.float64)  # (L, 2)
+        else:
+            raise ValueError("LandmarkMap requires either num_landmarks or landmark_positions")
+
+        self._len_M = self.n_cells ** self.num_candidate_landmarks  # |M| = K^L = (n²)^L
 
     @property
     def len_M(self) -> int:
-        """Number of possible maps: 2^N where N is number of candidate landmarks."""
+        """Number of possible maps: (n²)^L."""
         return self._len_M
+
+    def get_cache_fingerprint(self) -> tuple:
+        """Return a hashable tuple identifying the workspace grid (for cache keys).
+        Ensures caches for Q_n, all_maps, p_n_M are invalidated when the grid changes.
+        """
+        return (
+            float(self.x_min), float(self.x_max),
+            float(self.y_min), float(self.y_max),
+            int(self.n), int(self.n_cells), int(self.num_candidate_landmarks),
+        )
 
     @property
     def map_shape(self) -> Tuple[int, ...]:
-        """
-        Shape of individual map representation.
-
-        For landmark maps, this is (num_candidate_landmarks,) - a binary vector.
-        """
-        return (self.num_candidate_landmarks,)
+        """Shape of a single map: (L, 2) landmark positions."""
+        return (self.num_candidate_landmarks, 2)
 
     def d_M(self, m1: np.ndarray, m2: np.ndarray, p: float = 2.0) -> float:
         """
-        Metric on the map space: Lp norm between landmark indicator vectors.
-
-        For landmark maps, this is simply the Lp norm of the difference between
-        binary indicator vectors. The Lp-Hausdorff metric reduces to this for
-        discrete point sets.
+        Lp norm of per-landmark Euclidean distances.
 
         Args:
-            m1: First map as binary vector (num_candidate_landmarks,)
-            m2: Second map as binary vector (num_candidate_landmarks,)
-            p: Lp norm parameter (default: 2.0 for L2 norm)
-                Use p=float('inf') for L∞ norm
-
-        Returns:
-            float: Lp distance between maps
+            m1, m2: (L, 2) landmark-position arrays.
+            p: Lp exponent (use float('inf') for L∞).
         """
-        m1_flat = m1.flatten() if m1.ndim > 1 else m1
-        m2_flat = m2.flatten() if m2.ndim > 1 else m2
-        diff = m1_flat - m2_flat
-
+        per_lm = np.linalg.norm(
+            np.asarray(m1).reshape(-1, 2) - np.asarray(m2).reshape(-1, 2),
+            axis=1,
+        )  # (L,) per-landmark distances
         if p == float('inf'):
-            return float(np.max(np.abs(diff)))
-        else:
-            return float(np.linalg.norm(diff, ord=p))
+            return float(np.max(per_lm))
+        return float(np.linalg.norm(per_lm, ord=p))
 
     def generate_all_maps(self, show_progress: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
-        Generate all possible landmark maps.
-
-        Args:
-            show_progress: Whether to show progress bar
+        Generate all (n²)^L landmark maps.
 
         Returns:
-            Tuple of (maps_array, map_ids):
-            - maps_array: Array of shape (len_M, num_candidate_landmarks) with binary vectors
-            - map_ids: Array of shape (len_M,) with integer IDs (same as bit representation)
+            maps_array: (len_M, L, 2) array of landmark positions.
+            map_ids:    (len_M,) integer ids in [0, len_M).
         """
-        try:
-            from tqdm import tqdm
-            _tqdm_available = True
-        except ImportError:
-            _tqdm_available = False
-
-        total_maps = self.len_M
-        maps_list = []
-        map_ids_list = []
-
-        iterator = range(total_maps)
-        if show_progress and _tqdm_available:
-            iterator = tqdm(iterator, desc="Generating all landmark maps", leave=False, unit="map")
-
-        for map_id in iterator:
-            map_array = self.id_to_map(map_id)
-            maps_list.append(map_array)
-            map_ids_list.append(map_id)
-
-        maps_array = np.stack(maps_list, axis=0)  # (len_M, num_candidate_landmarks)
-        map_ids_array = np.array(map_ids_list, dtype=np.int64)
-
-        return maps_array, map_ids_array
+        L = self.num_candidate_landmarks
+        K = self.n_cells
+        # All K^L combinations of L cell indices, MSB = landmark 0.
+        coords = [np.arange(K) for _ in range(L)]
+        mesh = np.meshgrid(*coords, indexing='ij')    # each (K,…,K) with L dims
+        idx_grid = np.stack([g.ravel() for g in mesh], axis=1)  # (len_M, L)
+        maps_array = self.cell_centers[idx_grid]           # (len_M, L, 2)
+        map_ids = np.arange(self.len_M, dtype=np.int64)
+        return np.asarray(maps_array), map_ids
 
     def map_to_id(self, m: np.ndarray) -> int:
         """
-        Convert a landmark map to a unique identifier.
+        Encode an (L, 2) position array to its base-K integer id.
 
-        The ID is the bit representation of the binary vector.
+        Each landmark position is snapped to the nearest cell centre.
 
         Args:
-            m: Map as binary vector (num_candidate_landmarks,)
+            m: (L, 2) array of landmark positions, or (L,) array of cell indices.
 
         Returns:
-            int: Unique identifier (bit representation)
+            int: Unique identifier in [0, len_M).
         """
-        m_flat = np.asarray(m, dtype=np.uint8).ravel()
+        m_arr = np.asarray(m)
+        if m_arr.ndim == 1 and m_arr.size == self.num_candidate_landmarks:
+            cell_indices = m_arr.astype(int)
+        else:
+            m_2d = m_arr.reshape(-1, 2)  # (L, 2)
+            diffs = m_2d[:, None, :] - self.cell_centers[None, :, :]  # (L, K, 2)
+            cell_indices = np.argmin(np.linalg.norm(diffs, axis=2), axis=1)  # (L,)
+        K = self.n_cells
         map_id = 0
-        for idx, v in enumerate(m_flat):
-            if v:
-                map_id |= (1 << idx)
+        for idx in cell_indices:
+            map_id = map_id * K + int(idx)
         return map_id
 
     def id_to_map(self, map_id: int) -> np.ndarray:
         """
-        Convert a map identifier to a landmark map representation.
+        Decode a base-K integer into an (L, 2) array of landmark positions.
 
         Args:
-            map_id: Unique identifier (bit representation)
+            map_id: Integer in [0, len_M).
 
         Returns:
-            np.ndarray: Binary vector (num_candidate_landmarks,) indicating which landmarks are present
+            np.ndarray: (L, 2) array of cell-centre coordinates.
         """
-        out = np.zeros(self.num_candidate_landmarks, dtype=np.uint8)
-        for k in range(self.num_candidate_landmarks):
-            out[k] = (map_id >> k) & 1
-        return out
+        L = self.num_candidate_landmarks
+        K = self.n_cells
+        indices = []
+        remaining = int(map_id)
+        for _ in range(L):
+            indices.append(remaining % K)
+            remaining //= K
+        indices = indices[::-1]  # MSB = landmark 0
+        return np.asarray(self.cell_centers[indices])  # (L, 2)
 
     def get_obstacle_segments(self, m: np.ndarray) -> list:
         """
-        Extract obstacle segments from a landmark map for ray casting.
-
-        For landmark maps, we convert landmarks to small obstacle segments.
-        Each landmark is represented as a small square obstacle.
+        Return tiny square segments around each landmark position (for ray casting).
 
         Args:
-            m: Map as binary vector (num_candidate_landmarks,)
+            m: (L, 2) landmark positions.
 
         Returns:
-            list: List of obstacle segments (x1, y1, x2, y2) for each active landmark
+            list of (x1, y1, x2, y2) tuples.
         """
-        # Get active landmarks
-        active_mask = m.flatten() > 0
-        active_landmarks = self.landmark_positions[active_mask]  # (K, 2)
-
-        # Convert each landmark to a small square obstacle segment
-        # Use a small size (e.g., 0.1 units) for each landmark
-        landmark_size = 0.1
-        half_size = landmark_size / 2.0
-
+        half = 0.05
         segments = []
-        for landmark_pos in active_landmarks:
-            x, y = landmark_pos[0], landmark_pos[1]
-            # Create a small square: four segments forming a square
-            # Top edge
-            segments.append((x - half_size, y + half_size, x + half_size, y + half_size))
-            # Right edge
-            segments.append((x + half_size, y + half_size, x + half_size, y - half_size))
-            # Bottom edge
-            segments.append((x + half_size, y - half_size, x - half_size, y - half_size))
-            # Left edge
-            segments.append((x - half_size, y - half_size, x - half_size, y + half_size))
-
+        for pos in np.asarray(m).reshape(-1, 2):
+            x, y = float(pos[0]), float(pos[1])
+            segments += [
+                (x - half, y + half, x + half, y + half),
+                (x + half, y + half, x + half, y - half),
+                (x + half, y - half, x - half, y - half),
+                (x - half, y - half, x - half, y + half),
+            ]
         return segments
 
     def get_landmark_positions(self, m: np.ndarray) -> np.ndarray:
-        """
-        Get actual landmark positions for a given map.
-
-        Args:
-            m: Map as binary vector (num_candidate_landmarks,)
-
-        Returns:
-            np.ndarray: Array of shape (K, 2) with positions of active landmarks
-        """
-        active_mask = m.flatten() > 0
-        return self.landmark_positions[active_mask]
+        """Return the (L, 2) landmark positions from a map array."""
+        return np.asarray(m).reshape(-1, 2)
 
 
 class OrderedLandmarkMap(BaseMap):
@@ -427,7 +421,7 @@ class OrderedLandmarkMap(BaseMap):
 
         N = self.num_candidate_landmarks
         l = self.num_landmarks
-        
+
         # Generate indices in the same order as map_to_id() expects
         # map_to_id computes: id = idx[0]*N^(l-1) + idx[1]*N^(l-2) + ... + idx[l-1]*N^0
         # So idx[0] varies slowest, idx[l-1] varies fastest

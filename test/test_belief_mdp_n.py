@@ -1,5 +1,5 @@
 from src.utils.metrics import tvd, W1_m, W1_state_simple
-from src.classes.belief_mdp_n import BeliefMDP_n
+from src.belief_quantized.belief_mdp_n import BeliefMDP_n_SLAM as BeliefMDP_n
 from src.classes.model import SingleIntegratorModel, LIDAR
 from src.classes.mapping import LidarGridMapVec
 from src.utils.map import load_obstacles_config
