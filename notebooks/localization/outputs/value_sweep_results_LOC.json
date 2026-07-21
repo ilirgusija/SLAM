@@ -1,0 +1,29 @@
+[
+  {
+    "n": 2,
+    "M": 2,
+    "m_n": 16,
+    "cardinality": 136,
+    "value_initial": 26.457494735717773,
+    "value_mean": 27.742280960083008,
+    "iterations": 276
+  },
+  {
+    "n": 3,
+    "M": 2,
+    "m_n": 81,
+    "cardinality": 3321,
+    "value_initial": 1.6637209391732154e-15,
+    "value_mean": 0.8287023901939392,
+    "iterations": 6
+  },
+  {
+    "n": 2,
+    "M": 3,
+    "m_n": 16,
+    "cardinality": 816,
+    "value_initial": 26.457494735717773,
+    "value_mean": 27.661455154418945,
+    "iterations": 279
+  }
+]
